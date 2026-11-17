@@ -53,14 +53,38 @@ export function analyzeBookRecursion(entriesObj, participantNames = []) {
         }
     }
 
-    const matchKeyInText = (haystackLower, rawHaystack, rawKey) => {
+    const matchKeyInText = (haystackLower, rawHaystack, rawKey, wholeWords = true, caseSens = false) => {
         const k = String(rawKey || '').trim();
         if (!k) return false;
         const rxMatch = k.match(/^\/(.+)\/([gimsuy]*)$/);
         if (rxMatch) {
             try { return new RegExp(rxMatch[1], rxMatch[2]).test(rawHaystack); } catch { return false; }
         }
-        return haystackLower.includes(k.toLowerCase());
+        const hay = caseSens ? rawHaystack : haystackLower;
+        const needle = caseSens ? k : k.toLowerCase();
+        if (wholeWords && /^[\p{L}\p{N}_-]+$/u.test(needle)) {
+            const esc = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            try {
+                const re = new RegExp(`(^|[^\\p{L}\\p{N}_])${esc}(?=$|[^\\p{L}\\p{N}_])`, caseSens ? 'u' : 'iu');
+                return re.test(rawHaystack);
+            } catch {}
+        }
+        return hay.includes(needle);
+    };
+
+    const checkSecondaryKeys = (lowContent, rawContent, dst, wholeWords, caseSens) => {
+        if (!dst.selective) return true;
+        const secKeys = Array.isArray(dst.keysecondary)
+            ? dst.keysecondary.map(k => String(k || '').trim()).filter(Boolean)
+            : [];
+        if (secKeys.length === 0) return true;
+        const logic = Number(dst.selectiveLogic) || 0; // 0: AND_ANY, 1: NOT_ALL, 2: NOT_ANY, 3: AND_ALL
+        const matches = secKeys.map(sk => matchKeyInText(lowContent, rawContent, sk, wholeWords, caseSens));
+        if (logic === 0) return matches.some(Boolean);
+        if (logic === 1) return !matches.every(Boolean);
+        if (logic === 2) return !matches.some(Boolean);
+        if (logic === 3) return matches.every(Boolean);
+        return matches.some(Boolean);
     };
 
     for (const src of entries) {
@@ -72,12 +96,14 @@ export function analyzeBookRecursion(entriesObj, participantNames = []) {
         for (const dst of entries) {
             if (String(src.uid) === String(dst.uid)) continue;
             if (dst.constant || dst.excludeRecursion) continue;
+            const wholeWords = dst.matchWholeWords !== false;
+            const caseSens = Boolean(dst.caseSensitive);
             const keys = Array.isArray(dst.key) ? dst.key : [];
             let hitKey = '';
             for (const k of keys) {
-                if (matchKeyInText(lowContent, rawContent, k)) { hitKey = String(k).trim(); break; }
+                if (matchKeyInText(lowContent, rawContent, k, wholeWords, caseSens)) { hitKey = String(k).trim(); break; }
             }
-            if (hitKey) {
+            if (hitKey && checkSecondaryKeys(lowContent, rawContent, dst, wholeWords, caseSens)) {
                 outMap[src.uid].push({ uid: dst.uid, title: dst.comment || ('#' + dst.uid), key: hitKey });
                 inMap[dst.uid].push({ uid: src.uid, title: src.comment || ('#' + src.uid), key: hitKey });
             }

@@ -271,14 +271,14 @@ export function createForgeController(deps) {
     }
 
     async function saveBookData(fileId, data) {
-        state.bookCounts[fileId] = Object.keys(data?.entries || {}).length;
-        if (typeof stApi.saveWorldInfoNative === 'function') {
-            try { await stApi.saveWorldInfoNative(fileId, data); await stApi.refreshWorldInfoUI(); return; } catch {}
-        }
         const res = await fetch('/api/worldinfo/edit', {
             method: 'POST', headers: stApi.getRequestHeaders(), body: JSON.stringify({ name: fileId, data }),
         });
-        if (!res.ok) throw new Error('Ошибка сохранения Лорбука.');
+        if (!res.ok) {
+            const errTxt = await res.text().catch(() => '');
+            throw new Error(`Ошибка сохранения Лорбука (HTTP ${res.status})${errTxt ? ': ' + errTxt.slice(0, 120) : ''}`);
+        }
+        state.bookCounts[fileId] = Object.keys(data?.entries || {}).length;
         await stApi.refreshWorldInfoUI();
     }
 
@@ -685,6 +685,13 @@ export function createForgeController(deps) {
         } else {
             const rawName = (state.targetBookName || '').trim() || ('Лорбук_' + (stApi.ctx.name2 || 'Мира'));
             fileId = rawName.replace(/[<>:"/\\|?*]/g, '_');
+            await fetchBooksList();
+            const existsAlready = state.books.some(b => String(b.file_id).toLowerCase() === fileId.toLowerCase());
+            if (existsAlready) {
+                const mergeOk = window.confirm(`Лорбук «${fileId}» уже существует! Добавить новые страницы в конец существующей книги (ОК) или отменить сохранение (Отмена)?`);
+                if (!mergeOk) return;
+                bookData = await loadBookData(fileId);
+            }
         }
         if (state.targetCover) {
             bookData.extensions = bookData.extensions || {};
@@ -1182,19 +1189,20 @@ export function createForgeController(deps) {
                     const outLinks = recReport.outMap[ent.uid] || [];
                     const hasLoop = loopUidSet.has(String(ent.uid));
 
+                    const safeUid = escapeHtml(String(ent.uid));
                     return `
                         <div class="pcx-card ${isOn ? '' : 'pcx-card-off'} ${isCol ? 'pcx-collapsed' : ''}">
                             <div class="pcx-card-top">
                                 <div class="pcx-card-title-group">
-                                    <div class="pcx-switch ${isOn ? 'pcx-on' : ''}" data-fg-toggle="${ent.uid}"></div>
-                                    <div class="pcx-card-title" data-fg-collapse="${ent.uid}">${escapeHtml(ent.comment || (tUi(uiLang, 'Страница #', 'Page #') + ent.uid))}</div>
+                                    <div class="pcx-switch ${isOn ? 'pcx-on' : ''}" data-fg-toggle="${safeUid}"></div>
+                                    <div class="pcx-card-title" data-fg-collapse="${safeUid}">${escapeHtml(ent.comment || (tUi(uiLang, 'Страница #', 'Page #') + String(ent.uid)))}</div>
                                 </div>
                                 <div style="display:flex;align-items:center;gap:5px;flex-shrink:0;">
                                     ${hasLoop ? `<span class="pcx-prio-badge" style="color:#ff5c77">${tUi(uiLang, 'Петля', 'Loop')}</span>` : ''}
                                     ${ent.preventRecursion ? `<span class="pcx-prio-badge">${tUi(uiLang, 'Без каскада', 'Isolated')}</span>` : ''}
                                     ${isCol && keysArr.length > 0 ? `<span class="pcx-prio-badge">${keysArr.length} ${tUi(uiLang, 'кл.', 'keys')}</span>` : ''}
                                     <span class="pcx-prio-badge">${modeTag}</span>
-                                    <button type="button" class="pcx-collapse-btn" data-fg-collapse="${ent.uid}" title="${isCol ? tUi(uiLang, 'Развернуть запись', 'Expand entry') : tUi(uiLang, 'Свернуть запись', 'Collapse entry')}">${isCol ? ICONS.chevDown : ICONS.chevUp}</button>
+                                    <button type="button" class="pcx-collapse-btn" data-fg-collapse="${safeUid}" title="${isCol ? tUi(uiLang, 'Развернуть запись', 'Expand entry') : tUi(uiLang, 'Свернуть запись', 'Collapse entry')}">${isCol ? ICONS.chevDown : ICONS.chevUp}</button>
                                 </div>
                             </div>
                             ${!isCol ? `
@@ -1205,11 +1213,11 @@ export function createForgeController(deps) {
                                 ${outLinks.length > 0 ? `<div class="pcx-rec-note">${hasLoop ? `<b>${tUi(uiLang, 'Взаимная петля рекурсии!', 'Mutual recursion loop!')}</b> ` : ''}${tUi(uiLang, 'Цепляет по рекурсии:', 'Triggers via recursion:')} ${outLinks.map(o => `«${escapeHtml(o.title)}» (${escapeHtml(o.key)})`).join(', ')}</div>` : ''}
                                 <div class="pcx-card-content" style="max-height:145px">${escapeHtml(ent.content || '')}</div>
                                 <div class="pcx-card-footer">
-                                    <button type="button" class="pcx-mini-btn" data-fg-norec="${ent.uid}" title="Запретить тексту этой страницы будить другие страницы">${ICONS.loop}<span>${ent.preventRecursion ? tUi(uiLang, 'Изолирована', 'Isolated') : tUi(uiLang, 'Рекурсия', 'Recursion')}</span></button>
-                                    <button type="button" class="pcx-mini-btn" data-fg-vec="${ent.uid}">${ICONS.vector}<span>${ent.vectorized ? tUi(uiLang, 'Вектор: ВКЛ', 'Vector: ON') : tUi(uiLang, 'Вектор', 'Vector')}</span></button>
-                                    <button type="button" class="pcx-mini-btn" data-fg-ai-edit="${ent.uid}">${ICONS.spark}<span>${tUi(uiLang, 'С ИИ', 'AI')}</span></button>
-                                    <button type="button" class="pcx-mini-btn" data-fg-edit="${ent.uid}">${ICONS.edit}<span>${tUi(uiLang, 'Править', 'Edit')}</span></button>
-                                    <button type="button" class="pcx-mini-btn" data-fg-del="${ent.uid}">${ICONS.trash}</button>
+                                    <button type="button" class="pcx-mini-btn" data-fg-norec="${safeUid}" title="Запретить тексту этой страницы будить другие страницы">${ICONS.loop}<span>${ent.preventRecursion ? tUi(uiLang, 'Изолирована', 'Isolated') : tUi(uiLang, 'Рекурсия', 'Recursion')}</span></button>
+                                    <button type="button" class="pcx-mini-btn" data-fg-vec="${safeUid}">${ICONS.vector}<span>${ent.vectorized ? tUi(uiLang, 'Вектор: ВКЛ', 'Vector: ON') : tUi(uiLang, 'Вектор', 'Vector')}</span></button>
+                                    <button type="button" class="pcx-mini-btn" data-fg-ai-edit="${safeUid}">${ICONS.spark}<span>${tUi(uiLang, 'С ИИ', 'AI')}</span></button>
+                                    <button type="button" class="pcx-mini-btn" data-fg-edit="${safeUid}">${ICONS.edit}<span>${tUi(uiLang, 'Править', 'Edit')}</span></button>
+                                    <button type="button" class="pcx-mini-btn" data-fg-del="${safeUid}">${ICONS.trash}</button>
                                 </div>
                             ` : ''}
                         </div>`;
@@ -1359,6 +1367,21 @@ export function createForgeController(deps) {
         win.querySelector('#pcx-fg-create-manual-confirm')?.addEventListener('click', async () => {
             const name = (state.newBookName || '').trim(); if (!name) return;
             const fileId = name.replace(/[<>:"/\\|?*]/g, '_');
+            await fetchBooksList();
+            const existsAlready = state.books.some(b => String(b.file_id).toLowerCase() === fileId.toLowerCase());
+            if (existsAlready) {
+                const overwriteOk = window.confirm(`Лорбук «${fileId}» уже существует на полке! Открыть существующий том без стирания (ОК) или отменить (Отмена)?`);
+                if (!overwriteOk) return;
+                const existingData = await loadBookData(fileId);
+                if (state.newBookCover) {
+                    existingData.extensions = existingData.extensions || {};
+                    existingData.extensions.pocket_codex_cover = state.newBookCover;
+                    await saveBookData(fileId, existingData);
+                }
+                await applyBindingScope(fileId, state.newBookBindScope);
+                state.activeBookId = fileId; state.activeBookData = existingData; state.screen = 'book_entries'; requestRender();
+                return;
+            }
             const data = { entries: {}, extensions: {} };
             if (state.newBookCover) data.extensions.pocket_codex_cover = state.newBookCover;
             await saveBookData(fileId, data);

@@ -512,7 +512,7 @@ async function runAiNoteGeneration({ taskText, currentDraftText, attachments, pr
     const cb = buildChatContextSnippet(s.aiChatRadius);
     if (cb) parts.push(cb);
     if (Array.isArray(attachments)) {
-        const docs = attachments.filter(a => a.kind === 'text' && a.text);
+        const docs = attachments.filter(a => a.kind === 'text' && a.includeInPrompt !== false && a.text);
         if (docs.length) parts.push('[Прикреплённые файлы]\n' + docs.map(d => `--- ${d.name} ---\n${d.text.slice(0, 15000)}`).join('\n\n'));
     }
     if (previousCandidate && refinementInstruction) {
