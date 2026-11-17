@@ -1,0 +1,11 @@
+{
+    "display_name": "Pocket Codex & Forge [BETA]",
+    "loading_order": 15,
+    "requires": [],
+    "optional": [],
+    "js": "suite_entry.js",
+    "css": "suite_styles.css",
+    "author": "Gerodot535",
+    "version": "0.9.8-beta",
+    "homePage": "https://github.com/Gerodot535/st-pocket-codex"
+}
