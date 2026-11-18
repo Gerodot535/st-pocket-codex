@@ -74,6 +74,7 @@ let isExpandingMacro = false;
 let codexAiSeq = 0;
 const activeRegisteredPromptKeys = new Set();
 const lastActivatedWiKeys = new Set();
+const ownSavedWiPayloads = new WeakSet();
 
 let uiState = {
     wing: 'codex', view: 'notes', sectionMode: 'create', secDraft: null, editTab: 'manual',
@@ -143,14 +144,19 @@ async function initStApi() {
         saveSettings() { const fn = this.ctx.saveSettingsDebounced || scriptMod.saveSettingsDebounced; if (typeof fn === 'function') fn(); },
         saveMetadata() {
             if (!this.isChatOpen()) return;
-            // saveMetadata writes only chat metadata. saveChatDebounced can overwrite a
-            // newer message snapshot produced by another extension or the core UI.
-            const fn = this.ctx.saveMetadata || this.ctx.saveMetadataDebounced || extMod.saveMetadata;
-            if (typeof fn === 'function') fn();
-        },
-        cancelPendingChatSaves() {
-            scriptMod.cancelDebouncedChatSave?.();
-            extMod.cancelDebouncedMetadataSave?.();
+            const debouncedFn = this.ctx.saveMetadataDebounced || extMod.saveMetadataDebounced;
+            if (typeof debouncedFn === 'function') {
+                Promise.resolve().then(() => debouncedFn()).catch((err) => {
+                    console.warn('[PocketCodex] saveMetadataDebounced warning:', err);
+                });
+                return;
+            }
+            const immediateFn = this.ctx.saveMetadata || extMod.saveMetadata;
+            if (typeof immediateFn === 'function') {
+                Promise.resolve().then(() => immediateFn()).catch((err) => {
+                    console.warn('[PocketCodex] saveMetadata warning:', err);
+                });
+            }
         },
         setPrompt(key, value, pos, depth, scan, role) { const fn = this.ctx.setExtensionPrompt || scriptMod.setExtensionPrompt; if (typeof fn === 'function') fn(key, value, pos, depth, scan, role); },
         registerMacro(name, fn) { if (typeof this.ctx.registerMacro === 'function') { try { this.ctx.registerMacro(name, fn); } catch {} } },
@@ -267,17 +273,38 @@ async function initStApi() {
             if (!bookName || uid === undefined || uid === null) return false;
             return lastActivatedWiKeys.has(`${bookName}::${uid}`);
         },
-        async syncWorldInfoAfterSave(name, data) {
+        isOwnWorldInfoSave(bookData) {
+            return Boolean(bookData && typeof bookData === 'object' && ownSavedWiPayloads.has(bookData));
+        },
+        async saveWorldInfoBook(name, data) {
+            if (!name || !data || typeof data !== 'object') {
+                throw new Error('Некорректные данные Лорбука для сохранения.');
+            }
+            const cacheSnapshot = JSON.parse(JSON.stringify(data));
+            ownSavedWiPayloads.add(cacheSnapshot);
             try {
-                const cloned = JSON.parse(JSON.stringify(data));
-                worldInfoModRef?.worldInfoCache?.set?.(name, cloned);
-                try { worldInfoModRef?.reloadEditor?.(name, false); } catch {}
-                const evSrc = this.eventSource, evT = this.eventTypes;
-                if (evSrc?.emit && evT?.WORLDINFO_UPDATED) {
-                    await evSrc.emit(evT.WORLDINFO_UPDATED, name, cloned);
+                if (typeof worldInfoModRef?.saveWorldInfo === 'function') {
+                    await worldInfoModRef.saveWorldInfo(name, cacheSnapshot, true);
+                } else {
+                    const res = await fetch('/api/worldinfo/edit', {
+                        method: 'POST',
+                        headers: this.getRequestHeaders(),
+                        body: JSON.stringify({ name, data: cacheSnapshot }),
+                    });
+                    if (!res.ok) {
+                        const errTxt = await res.text().catch(() => '');
+                        throw new Error(`Ошибка сохранения Лорбука (HTTP ${res.status})${errTxt ? ': ' + errTxt.slice(0, 120) : ''}`);
+                    }
+                    worldInfoModRef?.worldInfoCache?.set?.(name, cacheSnapshot);
+                    const evSrc = this.eventSource, evT = this.eventTypes;
+                    if (evSrc?.emit && evT?.WORLDINFO_UPDATED) {
+                        await evSrc.emit(evT.WORLDINFO_UPDATED, name, cacheSnapshot);
+                    }
                 }
-            } catch (err) {
-                console.warn('[PocketCodex] Cache sync warning:', err);
+                try { worldInfoModRef?.reloadEditor?.(name, false); } catch {}
+                return JSON.parse(JSON.stringify(cacheSnapshot));
+            } finally {
+                ownSavedWiPayloads.delete(cacheSnapshot);
             }
         },
         async deleteWorldInfoBook(name) {
@@ -1934,6 +1961,7 @@ jQuery(async () => {
         }
         if (evTypes.WORLDINFO_UPDATED) {
             evSource.on(evTypes.WORLDINFO_UPDATED, (bookName, bookData) => {
+                if (stApi.isOwnWorldInfoSave(bookData)) return;
                 const changed = forgeCtrl?.onExternalWorldInfoUpdated?.(bookName, bookData);
                 if (!changed) return;
                 const dlg = document.getElementById('pcx-dialog');
@@ -1968,7 +1996,6 @@ jQuery(async () => {
                 if (ev === evTypes.CHAT_CHANGED) {
                     codexAiSeq++;
                     lastActivatedWiKeys.clear();
-                    stApi.cancelPendingChatSaves();
                     resetEditDrafts();
                     forgeCtrl?.resetTransientState?.();
                 }

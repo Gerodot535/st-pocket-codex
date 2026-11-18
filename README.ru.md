@@ -2,7 +2,7 @@
 
 ![Pocket Codex & Forge Banner](assets/hero-banner.jpg)
 
-# Pocket Codex & Forge `[BETA v1.0.1]`
+# Pocket Codex & Forge `[BETA v1.0.2]`
 
 **Двухкрылый Кодекс Автора и Кузница Лорбуков для SillyTavern — созданный для комфортной работы и на телефонах, и на ПК.**
 

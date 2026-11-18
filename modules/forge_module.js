@@ -171,6 +171,15 @@ function makeStandardWiEntry(uid, item = {}, wiTemplate = null) {
     };
 }
 
+const SAFE_COVER_DATA_URL_RE = /^data:image\/(?:png|jpeg|webp|gif);base64,[A-Za-z0-9+/=\s]+$/i;
+
+export function sanitizeCoverDataUrl(raw) {
+    if (typeof raw !== 'string') return '';
+    const trimmed = raw.trim();
+    if (!trimmed || trimmed.length > 4_000_000) return '';
+    return SAFE_COVER_DATA_URL_RE.test(trimmed) ? trimmed.replace(/\s+/g, '') : '';
+}
+
 function pluralizePages(n, uiLang = 'ru') {
     if (uiLang === 'en') return n === 1 ? '1 page' : `${n} pages`;
     const mod10 = n % 10, mod100 = n % 100;
@@ -388,9 +397,10 @@ export function createForgeController(deps) {
                     try {
                         const data = await loadBookData(b.file_id);
                         state.bookCounts[b.file_id] = Object.keys(data.entries || {}).length;
-                        if (data.extensions?.pocket_codex_cover && (!b.extensions || !b.extensions.pocket_codex_cover)) {
+                        const safeCover = sanitizeCoverDataUrl(data.extensions?.pocket_codex_cover);
+                        if (safeCover && (!b.extensions || !b.extensions.pocket_codex_cover)) {
                             b.extensions = b.extensions || {};
-                            b.extensions.pocket_codex_cover = data.extensions.pocket_codex_cover;
+                            b.extensions.pocket_codex_cover = safeCover;
                         }
                         changed = true;
                     } catch {}
@@ -420,16 +430,18 @@ export function createForgeController(deps) {
     }
 
     const bookWriteQueues = new Map();
-    const savingBooksNow = new Set();
 
     function enqueueBookWrite(fileId, taskFn) {
         const key = String(fileId || '');
         const prev = bookWriteQueues.get(key) || Promise.resolve();
-        const next = prev.catch(() => {}).then(() => taskFn());
-        bookWriteQueues.set(key, next.finally(() => {
-            if (bookWriteQueues.get(key) === next) bookWriteQueues.delete(key);
-        }));
-        return next;
+        const runPromise = prev.catch(() => {}).then(() => taskFn());
+        const queueTail = runPromise.catch(() => {}).finally(() => {
+            if (bookWriteQueues.get(key) === queueTail) {
+                bookWriteQueues.delete(key);
+            }
+        });
+        bookWriteQueues.set(key, queueTail);
+        return runPromise;
     }
 
     async function loadBookData(fileId, { preferCache = true } = {}) {
@@ -464,24 +476,17 @@ export function createForgeController(deps) {
 
     async function saveBookData(fileId, data, { refreshList = false } = {}) {
         const isNewBookFile = refreshList || !state.books.some(b => b.file_id === fileId);
-        const payload = JSON.parse(JSON.stringify(normalizeLoadedEntries(data)));
-        savingBooksNow.add(fileId);
-        try {
-            const res = await fetch('/api/worldinfo/edit', {
-                method: 'POST', headers: stApi.getRequestHeaders(), body: JSON.stringify({ name: fileId, data: payload }),
-            });
-            if (!res.ok) {
-                const errTxt = await res.text().catch(() => '');
-                throw new Error(`Ошибка сохранения Лорбука (HTTP ${res.status})${errTxt ? ': ' + errTxt.slice(0, 120) : ''}`);
-            }
-            state.bookCounts[fileId] = Object.keys(payload.entries || {}).length;
-            state.saveError = '';
-            await stApi.syncWorldInfoAfterSave?.(fileId, payload);
-            if (isNewBookFile) await stApi.refreshWorldInfoUI();
-            return payload;
-        } finally {
-            savingBooksNow.delete(fileId);
+        const payload = normalizeLoadedEntries(JSON.parse(JSON.stringify(data)));
+        if (payload.extensions && Object.prototype.hasOwnProperty.call(payload.extensions, 'pocket_codex_cover')) {
+            const safeCover = sanitizeCoverDataUrl(payload.extensions.pocket_codex_cover);
+            if (safeCover) payload.extensions.pocket_codex_cover = safeCover;
+            else delete payload.extensions.pocket_codex_cover;
         }
+        const saved = await stApi.saveWorldInfoBook(fileId, payload);
+        state.bookCounts[fileId] = Object.keys(saved.entries || {}).length;
+        state.saveError = '';
+        if (isNewBookFile) await stApi.refreshWorldInfoUI();
+        return saved;
     }
 
     async function mutateBookAtomically(fileId, mutatorFn) {
@@ -673,12 +678,9 @@ export function createForgeController(deps) {
             : (state.entryTargetBookId || state.activeBookId);
         if (!targetBookId) return false;
 
+        const s = ensureSettings();
+        const uiLang = s.uiLang || 'ru';
         const cleanDraft = JSON.parse(JSON.stringify(draftObj));
-        if (!state.entryKeysDirty && Array.isArray(state.entryOriginalKeys) && isEditingExisting) {
-            cleanDraft.key = [...state.entryOriginalKeys];
-        } else {
-            cleanDraft.key = parseSmartTriggerKeys(cleanDraft.key);
-        }
         cleanDraft.position = parseSafePosition(cleanDraft.position, 1);
         cleanDraft.depth = parseSafeDepth(cleanDraft.depth, 4);
 
@@ -686,14 +688,41 @@ export function createForgeController(deps) {
             const editUidStr = String(state.editingUid);
             const savedBook = await mutateBookAtomically(targetBookId, (freshBook) => {
                 const entries = freshBook.entries;
-                if (isEditingExisting && entries[editUidStr]) {
+                if (isEditingExisting) {
+                    if (!Object.prototype.hasOwnProperty.call(entries, editUidStr) || !entries[editUidStr]) {
+                        throw new Error(tUi(
+                            uiLang,
+                            `Конфликт сохранения: страница #${editUidStr} была удалена во внешнем редакторе, пока форма была открыта. Ваш текст сохранён в черновике.`,
+                            `Save conflict: entry #${editUidStr} was deleted in an external editor while this form was open. Your text is preserved in the draft.`,
+                        ));
+                    }
                     const existingEntry = entries[editUidStr];
-                    const preservedUid = existingEntry.uid !== undefined ? existingEntry.uid : (Number.isNaN(Number(editUidStr)) ? editUidStr : Number(editUidStr));
-                    entries[editUidStr] = { ...existingEntry, ...cleanDraft, uid: preservedUid };
+                    const preservedUid = existingEntry.uid !== undefined
+                        ? existingEntry.uid
+                        : (Number.isNaN(Number(editUidStr)) ? editUidStr : Number(editUidStr));
+                    const editablePatch = {
+                        comment: String(cleanDraft.comment ?? '').trim().slice(0, 95),
+                        content: String(cleanDraft.content ?? ''),
+                        constant: Boolean(cleanDraft.constant),
+                        vectorized: Boolean(cleanDraft.vectorized),
+                        position: cleanDraft.position,
+                        depth: cleanDraft.depth,
+                        role: Number.isFinite(Number(cleanDraft.role)) ? Number(cleanDraft.role) : (existingEntry.role ?? 0),
+                        outletName: String(cleanDraft.outletName ?? '').trim(),
+                        preventRecursion: Boolean(cleanDraft.preventRecursion),
+                        excludeRecursion: Boolean(cleanDraft.excludeRecursion),
+                    };
+                    if (state.entryKeysDirty) {
+                        editablePatch.key = parseSmartTriggerKeys(cleanDraft.key);
+                    }
+                    entries[editUidStr] = { ...existingEntry, ...editablePatch, uid: preservedUid };
                 } else {
+                    const parsedNewKeys = (!state.entryKeysDirty && Array.isArray(state.entryOriginalKeys) && state.entryOriginalKeys.length > 0)
+                        ? [...state.entryOriginalKeys]
+                        : parseSmartTriggerKeys(cleanDraft.key);
                     const uids = Object.keys(entries).map(Number).filter(n => !Number.isNaN(n));
                     const nextUid = uids.length > 0 ? (Math.max(...uids) + 1) : 0;
-                    entries[String(nextUid)] = makeStandardWiEntry(nextUid, { ...cleanDraft, keys: cleanDraft.key }, stApi.worldInfoMod?.newWorldInfoEntryTemplate);
+                    entries[String(nextUid)] = makeStandardWiEntry(nextUid, { ...cleanDraft, keys: parsedNewKeys }, stApi.worldInfoMod?.newWorldInfoEntryTemplate);
                 }
             });
             state.activeBookId = targetBookId;
@@ -703,6 +732,7 @@ export function createForgeController(deps) {
             return true;
         } catch (err) {
             state.saveError = err?.message || String(err);
+            try { window.toastr?.warning?.(state.saveError); } catch {}
             return false;
         }
     }
@@ -1076,11 +1106,12 @@ export function createForgeController(deps) {
             const wiTpl = stApi.worldInfoMod?.newWorldInfoEntryTemplate;
             let savedData = null;
 
+            const safeTargetCover = sanitizeCoverDataUrl(state.targetCover);
             if (existingCheck) {
                 savedData = await mutateBookAtomically(fileId, (workingCopy) => {
-                    if (state.targetCover) {
+                    if (safeTargetCover) {
                         workingCopy.extensions = workingCopy.extensions || {};
-                        workingCopy.extensions.pocket_codex_cover = state.targetCover;
+                        workingCopy.extensions.pocket_codex_cover = safeTargetCover;
                     }
                     const uids = Object.keys(workingCopy.entries).map(Number).filter(n => !Number.isNaN(n));
                     let nextUid = uids.length > 0 ? (Math.max(...uids) + 1) : 0;
@@ -1091,15 +1122,15 @@ export function createForgeController(deps) {
                 });
             } else {
                 const workingCopy = { entries: {}, extensions: {} };
-                if (state.targetCover) {
-                    workingCopy.extensions.pocket_codex_cover = state.targetCover;
+                if (safeTargetCover) {
+                    workingCopy.extensions.pocket_codex_cover = safeTargetCover;
                 }
                 let nextUid = 0;
                 for (const item of chosenItems) {
                     workingCopy.entries[String(nextUid)] = makeStandardWiEntry(nextUid, item, wiTpl);
                     nextUid++;
                 }
-                savedData = await enqueueBookWrite(fileId, () => saveBookData(fileId, workingCopy));
+                savedData = await enqueueBookWrite(fileId, () => saveBookData(fileId, workingCopy, { refreshList: true }));
             }
             await applyBindingScope(fileId, state.bindAfterScope);
 
@@ -1185,7 +1216,7 @@ export function createForgeController(deps) {
                         </select>
                     </div>
                     <div style="display:flex;align-items:center;gap:12px;">
-                        <div class="pcx-book-cover" id="pcx-fg-newcover-pick">${state.newBookCover ? `<img src="${escapeHtml(state.newBookCover)}">` : `${ICONS.image}<span class="pcx-cover-hint">ART</span>`}</div>
+                        <div class="pcx-book-cover" id="pcx-fg-newcover-pick">${sanitizeCoverDataUrl(state.newBookCover) ? `<img src="${escapeHtml(sanitizeCoverDataUrl(state.newBookCover))}">` : `${ICONS.image}<span class="pcx-cover-hint">ART</span>`}</div>
                         <div style="display:flex;flex-direction:column;gap:6px;">
                             <button type="button" class="pcx-mini-btn" id="pcx-fg-newcover-btn">${ICONS.clip}<span>${tUi(uiLang, 'Прикрепить Арт-обложку', 'Attach Cover Art')}</span></button>
                             <input type="file" id="pcx-fg-newcover-input" accept="image/*" style="display:none">
@@ -1727,7 +1758,7 @@ export function createForgeController(deps) {
                         const isChat = chatBoundList.includes(b.file_id);
                         const isChar = charBound === b.file_id;
                         const isAny = isGlob || isChat || isChar;
-                        const cover = b.extensions?.pocket_codex_cover || '';
+                        const cover = sanitizeCoverDataUrl(b.extensions?.pocket_codex_cover);
                         const cnt = state.bookCounts[b.file_id];
                         const countLabel = cnt !== undefined ? pluralizePages(cnt, uiLang) : tUi(uiLang, 'Том знаний', 'Lore Tome');
 
@@ -1769,6 +1800,8 @@ export function createForgeController(deps) {
         const d = state.entryDraft;
         const cEl = win.querySelector('#pcx-fge-comment');
         const kEl = win.querySelector('#pcx-fge-keys');
+        const depEl = win.querySelector('#pcx-fge-depth');
+        const roleEl = win.querySelector('#pcx-fge-role');
         const outEl = win.querySelector('#pcx-fge-outlet');
         const tEl = win.querySelector('#pcx-fge-content');
         const taskEl = win.querySelector('#pcx-fgp-task');
@@ -1778,6 +1811,8 @@ export function createForgeController(deps) {
         const candT = win.querySelector('#pcx-fgc-content');
 
         if (cEl) d.comment = cEl.value;
+        if (depEl) d.depth = parseSafeDepth(depEl.value, 0);
+        if (roleEl) d.role = Number(roleEl.value);
         if (outEl) d.outletName = outEl.value;
         if (kEl && state.entryKeysDirty) {
             state.entryKeysRawText = kEl.value;
@@ -1907,10 +1942,11 @@ export function createForgeController(deps) {
                     ));
                     if (!openOk) return;
                     let existingData = await loadBookData(exactId);
-                    if (state.newBookCover) {
+                    const safeNewCover = sanitizeCoverDataUrl(state.newBookCover);
+                    if (safeNewCover) {
                         existingData = await mutateBookAtomically(exactId, (fresh) => {
                             fresh.extensions = fresh.extensions || {};
-                            fresh.extensions.pocket_codex_cover = state.newBookCover;
+                            fresh.extensions.pocket_codex_cover = safeNewCover;
                         });
                     }
                     await applyBindingScope(exactId, state.newBookBindScope);
@@ -1918,8 +1954,9 @@ export function createForgeController(deps) {
                     return;
                 }
                 const data = { entries: {}, extensions: {} };
-                if (state.newBookCover) data.extensions.pocket_codex_cover = state.newBookCover;
-                const saved = await saveBookData(sanitized, data);
+                const safeNewCover = sanitizeCoverDataUrl(state.newBookCover);
+                if (safeNewCover) data.extensions.pocket_codex_cover = safeNewCover;
+                const saved = await enqueueBookWrite(sanitized, () => saveBookData(sanitized, data, { refreshList: true }));
                 await applyBindingScope(sanitized, state.newBookBindScope);
                 await fetchBooksList();
                 state.activeBookId = sanitized; state.activeBookData = saved; state.screen = 'book_entries'; requestRender();
@@ -1977,9 +2014,11 @@ export function createForgeController(deps) {
             const f = e.target.files?.[0]; if (!f || !coverTargetBookId) return;
             try {
                 const att = await compressImageFile(f, 520, 0.82);
+                const safeCover = sanitizeCoverDataUrl(att.dataUrl);
+                if (!safeCover) throw new Error('Неподдерживаемый формат обложки (разрешены локальные PNG, JPEG, WebP и GIF).');
                 await mutateBookAtomically(coverTargetBookId, (fresh) => {
                     fresh.extensions = fresh.extensions || {};
-                    fresh.extensions.pocket_codex_cover = att.dataUrl;
+                    fresh.extensions.pocket_codex_cover = safeCover;
                 });
                 await fetchBooksList();
                 requestRender({ preserveBodyScroll: true });
@@ -2309,11 +2348,18 @@ export function createForgeController(deps) {
     return {
         onEnterForge() { fetchBooksList().then(() => requestRender()); },
         onExternalWorldInfoUpdated(bookName, bookData) {
-            if (!bookName || savingBooksNow.has(bookName)) return false;
+            if (!bookName || stApi.isOwnWorldInfoSave?.(bookData)) return false;
             let changed = false;
             if (bookData && typeof bookData === 'object') {
                 const normalized = normalizeLoadedEntries(JSON.parse(JSON.stringify(bookData)));
                 state.bookCounts[bookName] = Object.keys(normalized.entries || {}).length;
+                const shelfBook = state.books.find(b => b.file_id === bookName);
+                if (shelfBook) {
+                    const safeCover = sanitizeCoverDataUrl(normalized.extensions?.pocket_codex_cover);
+                    shelfBook.extensions = shelfBook.extensions || {};
+                    if (safeCover) shelfBook.extensions.pocket_codex_cover = safeCover;
+                    else delete shelfBook.extensions.pocket_codex_cover;
+                }
                 if (state.activeBookId === bookName && !this.isEditingForm) {
                     state.activeBookData = normalized;
                 }

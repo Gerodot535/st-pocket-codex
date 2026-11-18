@@ -201,7 +201,6 @@ export function analyzeBookRecursion(entriesObj, participantNames = [], wiDefaul
         const lowContent = rawContent.toLowerCase();
 
         for (const dst of entries) {
-            if (String(src.uid) === String(dst.uid)) continue;
             if (dst.constant || dst.excludeRecursion) continue;
             const wholeWords = (dst.matchWholeWords !== null && dst.matchWholeWords !== undefined)
                 ? Boolean(dst.matchWholeWords)
@@ -242,19 +241,21 @@ export function analyzeBookRecursion(entriesObj, participantNames = [], wiDefaul
             if (loops.length >= 24) return;
             for (const edge of (outMap[byUid.get(currId)?.uid] || [])) {
                 const nextId = String(edge.uid);
-                if (nextId === startId && pathIds.length >= 2) {
+                if (nextId === startId && pathIds.length >= 1) {
                     const sig = canonicalCycleSig(pathIds);
                     if (!seenCycles.has(sig)) {
                         seenCycles.add(sig);
                         const titles = pathIds.map(id => `«${byUid.get(id)?.comment || ('#' + id)}»`);
                         loops.push({
                             uids: pathIds.map(id => byUid.get(id)?.uid ?? id),
-                            label: pathIds.length === 2
-                                ? `${titles[0]} <-> ${titles[1]}`
-                                : `${titles.join(' -> ')} -> ${titles[0]}`,
+                            label: pathIds.length === 1
+                                ? `${titles[0]} -> ${titles[0]}`
+                                : (pathIds.length === 2
+                                    ? `${titles[0]} <-> ${titles[1]}`
+                                    : `${titles.join(' -> ')} -> ${titles[0]}`),
                         });
                     }
-                } else if (!visitedInPath.has(nextId) && pathIds.length < 8 && byUid.has(nextId)) {
+                } else if (!visitedInPath.has(nextId) && pathIds.length < 12 && byUid.has(nextId)) {
                     visitedInPath.add(nextId);
                     pathIds.push(nextId);
                     dfs(nextId, pathIds, visitedInPath);
