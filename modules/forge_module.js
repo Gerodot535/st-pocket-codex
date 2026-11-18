@@ -972,8 +972,18 @@ export function createForgeController(deps) {
                 d.content = cleanBody;
                 d.constant = Boolean(parsed.constant);
                 const ok = await saveDraftToTargetBook(d);
-                if (ok) state.pageAiTask = '';
-                else state.pageAiStatus = 'Ошибка сохранения: ' + state.saveError;
+                if (ok) {
+                    state.pageAiTask = '';
+                } else {
+                    state.pageAiCandidates.push({
+                        comment: d.comment,
+                        keys: genKeysArr.join(', '),
+                        content: cleanBody,
+                        constant: Boolean(parsed.constant),
+                    });
+                    state.pageAiCandIdx = state.pageAiCandidates.length - 1;
+                    state.pageAiStatus = 'Ошибка сохранения: ' + state.saveError;
+                }
                 return;
             }
 
@@ -1298,10 +1308,18 @@ export function createForgeController(deps) {
             state.wizStatus = postSaveNotice;
             state.screen = 'book_entries';
             requestRender();
+            return true;
         } catch (err) {
-            state.wizStatus = 'Ошибка сохранения: ' + (err?.message || String(err));
-            window.alert(state.wizStatus);
-            requestRender();
+            const msg = 'Ошибка сохранения: ' + (err?.message || String(err));
+            state.saveError = msg;
+            state.wizStatus = msg;
+            if (state.stagedEntries.length > 0) {
+                state.screen = 'approve';
+            }
+            try { window.toastr?.error?.(msg); } catch {}
+            window.alert(msg);
+            requestRender({ preserveBodyScroll: true });
+            return false;
         }
     }
 
@@ -1351,6 +1369,7 @@ export function createForgeController(deps) {
                         <span style="font-size:14.5px;font-weight:800;">${tUi(uiLang, 'Новый Лорбук', 'New Lorebook')}</span>
                         <button type="button" class="pcx-mini-btn" id="pcx-fg-back-shelf">${ICONS.chevLeft}<span>${tUi(uiLang, 'К полке', 'Shelf')}</span></button>
                     </div>
+                    ${state.saveError ? `<div class="pcx-err-banner"><span>${escapeHtml(state.saveError)}</span></div>` : ''}
                     <div><label class="pcx-field-label">${tUi(uiLang, 'Название Лорбука', 'Lorebook Name')}</label><input id="pcx-fg-newname" class="pcx-input" placeholder="${tUi(uiLang, 'Например: Хроники Кракоа / Мир Ведьмака', 'e.g. Chronicles of Krakoa')}" value="${escapeHtml(state.newBookName)}"></div>
                     <div>
                         <label class="pcx-field-label">${tUi(uiLang, 'Куда сразу подключить?', 'Initial Binding Scope')} ${renderHelpBtn('forge_scope')}</label>
@@ -1513,6 +1532,7 @@ export function createForgeController(deps) {
                             <button type="button" class="pcx-mini-btn" id="pcx-fg-back-wiz">${ICONS.chevLeft}<span>Назад</span></button>
                         </div>
                     </div>
+                    ${state.saveError ? `<div class="pcx-err-banner"><span>${escapeHtml(state.saveError)}</span></div>` : ''}
                     <div style="display:flex;flex-direction:column;gap:10px;max-height:400px;overflow-y:auto;">
                         ${state.stagedEntries.map((st, idx) => {
                             const isCol = Boolean(state.stagedCollapsed[idx]);
@@ -2135,7 +2155,11 @@ export function createForgeController(deps) {
                 await fetchBooksList();
                 state.activeBookId = sanitized; state.activeBookData = saved; state.saveError = postNotice; state.screen = 'book_entries'; requestRender();
             } catch (err) {
-                window.alert(tUi(uiLang, 'Не удалось проверить или создать Лорбук: ', 'Failed to verify or create Lorebook: ') + (err?.message || String(err)));
+                const msg = tUi(uiLang, 'Не удалось проверить или создать Лорбук: ', 'Failed to verify or create Lorebook: ') + (err?.message || String(err));
+                state.saveError = msg;
+                try { window.toastr?.error?.(msg); } catch {}
+                window.alert(msg);
+                requestRender({ preserveBodyScroll: true });
             }
         });
 
@@ -2515,7 +2539,7 @@ export function createForgeController(deps) {
             win.querySelectorAll('.pcx-st-outlet').forEach(el => el.addEventListener('input', () => { state.stagedEntries[Number(el.dataset.idx)].outletName = el.value; }));
             win.querySelectorAll('.pcx-st-role').forEach(el => el.addEventListener('change', () => { state.stagedEntries[Number(el.dataset.idx)].role = Number(el.value); }));
             win.querySelectorAll('.pcx-st-content').forEach(el => el.addEventListener('input', () => { state.stagedEntries[Number(el.dataset.idx)].content = el.value; }));
-            win.querySelector('#pcx-fg-commit-btn')?.addEventListener('click', commitApprovedLorebook);
+            win.querySelector('#pcx-fg-commit-btn')?.addEventListener('click', () => commitApprovedLorebook());
         }
     }
 

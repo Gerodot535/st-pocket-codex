@@ -285,23 +285,30 @@ async function initStApi() {
             const cacheSnapshot = JSON.parse(JSON.stringify(data));
             ownSavedWiPayloads.add(cacheSnapshot);
             try {
-                if (typeof worldInfoModRef?.saveWorldInfo === 'function') {
-                    await worldInfoModRef.saveWorldInfo(name, cacheSnapshot, true);
-                } else {
-                    const res = await fetch('/api/worldinfo/edit', {
-                        method: 'POST',
-                        headers: this.getRequestHeaders(),
-                        body: JSON.stringify({ name, data: cacheSnapshot }),
-                    });
-                    if (!res.ok) {
-                        const errTxt = await res.text().catch(() => '');
-                        throw new Error(`Ошибка сохранения Лорбука (HTTP ${res.status})${errTxt ? ': ' + errTxt.slice(0, 120) : ''}`);
-                    }
-                    worldInfoModRef?.worldInfoCache?.set?.(name, cacheSnapshot);
-                    const evSrc = this.eventSource, evT = this.eventTypes;
-                    if (evSrc?.emit && evT?.WORLDINFO_UPDATED) {
-                        await evSrc.emit(evT.WORLDINFO_UPDATED, name, cacheSnapshot);
-                    }
+                // Core saveWorldInfo() in SillyTavern does not check res.ok on /api/worldinfo/edit
+                // and mutates worldInfoCache before the request finishes. Verify HTTP status & JSON { ok: true } first!
+                const res = await fetch('/api/worldinfo/edit', {
+                    method: 'POST',
+                    headers: this.getRequestHeaders(),
+                    body: JSON.stringify({ name, data: cacheSnapshot }),
+                });
+                if (!res.ok) {
+                    const errTxt = await res.text().catch(() => '');
+                    throw new Error(`Ошибка сохранения Лорбука на сервере (HTTP ${res.status})${errTxt ? ': ' + errTxt.slice(0, 140) : ''}`);
+                }
+                let ack = null;
+                try {
+                    ack = await res.json();
+                } catch {
+                    throw new Error('Сервер вернул некорректный ответ при сохранении Лорбука (ожидался JSON { ok: true }).');
+                }
+                if (!ack || ack.ok !== true) {
+                    throw new Error('Сервер не подтвердил запись Лорбука на диск.');
+                }
+                worldInfoModRef?.worldInfoCache?.set?.(name, cacheSnapshot);
+                const evSrc = this.eventSource, evT = this.eventTypes;
+                if (evSrc?.emit && evT?.WORLDINFO_UPDATED) {
+                    await evSrc.emit(evT.WORLDINFO_UPDATED, name, cacheSnapshot);
                 }
                 try { worldInfoModRef?.reloadEditor?.(name, false); } catch {}
                 return JSON.parse(JSON.stringify(cacheSnapshot));
