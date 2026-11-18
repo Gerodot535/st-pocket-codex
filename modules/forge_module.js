@@ -248,6 +248,9 @@ export function createForgeController(deps) {
         lastDeletedEntry: null,
 
         // Single-page editor (manual + AI co-author with presets & word limits)
+        entrySessionId: 0,
+        entryCreatedUid: null,
+        entrySavingBusy: false,
         editingUid: null,
         editingOriginBookId: '',
         entryBaseSnapshot: null,
@@ -286,6 +289,9 @@ export function createForgeController(deps) {
         wizForging: false,
         wizStatus: '',
         wizOriginSession: null,
+        commitSavingBusy: false,
+        manualCreateBusy: false,
+        undoBusy: false,
 
         stagedEntries: [],
         stagedCollapsed: {},
@@ -298,6 +304,8 @@ export function createForgeController(deps) {
 
     let bookLoadSeq = 0;
     let forgeAiSeq = 0;
+    let chatEpoch = 0;
+    let entrySessionSeq = 0;
     let recCacheSig = '';
     let recCacheValue = null;
 
@@ -712,6 +720,11 @@ export function createForgeController(deps) {
     function openEntryEditor({ bookId, uid = null, initialTab = 'manual', bookData = null }) {
         const resolvedBookId = bookId || state.activeBookId || (state.books[0]?.file_id || '');
         const sourceBook = bookData || (resolvedBookId === state.activeBookId ? state.activeBookData : null);
+        state.entrySessionId = ++entrySessionSeq;
+        state.entryCreatedUid = null;
+        state.entrySavingBusy = false;
+        state.pageAiGenerating = false;
+        state.keysGenerating = false;
         state.entryTargetBookId = resolvedBookId;
         state.editingOriginBookId = uid !== null ? resolvedBookId : '';
         state.editingUid = uid;
@@ -740,12 +753,33 @@ export function createForgeController(deps) {
         state.screen = 'entry_edit';
     }
 
-    async function saveDraftToTargetBook(draftObj) {
-        const isEditingExisting = state.editingUid !== null;
-        const targetBookId = isEditingExisting
-            ? (state.editingOriginBookId || state.activeBookId)
-            : (state.entryTargetBookId || state.activeBookId);
-        if (!targetBookId) return false;
+    async function saveDraftToTargetBook(draftObj, explicitCtx = null) {
+        const isBackgroundPinned = Boolean(explicitCtx);
+        if (!isBackgroundPinned) {
+            if (state.entrySavingBusy) return false;
+            state.entrySavingBusy = true;
+        }
+
+        const effectiveUid = isBackgroundPinned
+            ? explicitCtx.editingUid
+            : (state.editingUid !== null ? state.editingUid : state.entryCreatedUid);
+        const isEditingExisting = effectiveUid !== null && effectiveUid !== undefined;
+        const targetBookId = isBackgroundPinned
+            ? explicitCtx.targetBookId
+            : (isEditingExisting
+                ? (state.editingOriginBookId || state.entryTargetBookId || state.activeBookId)
+                : (state.entryTargetBookId || state.activeBookId));
+
+        const usedSessionId = isBackgroundPinned ? explicitCtx.sessionId : state.entrySessionId;
+        const baseSnap = isBackgroundPinned ? explicitCtx.baseSnapshot : state.entryBaseSnapshot;
+        const keysDirty = isBackgroundPinned ? explicitCtx.keysDirty : state.entryKeysDirty;
+        const origKeys = isBackgroundPinned ? explicitCtx.originalKeys : state.entryOriginalKeys;
+        const forceHash = isBackgroundPinned ? explicitCtx.conflictForceHash : state.entryConflictForceHash;
+
+        if (!targetBookId) {
+            if (!isBackgroundPinned) state.entrySavingBusy = false;
+            return false;
+        }
 
         const s = ensureSettings();
         const uiLang = s.uiLang || 'ru';
@@ -753,8 +787,10 @@ export function createForgeController(deps) {
         cleanDraft.position = parseSafePosition(cleanDraft.position, 1);
         cleanDraft.depth = parseSafeDepth(cleanDraft.depth, 4);
 
+        let createdUidStr = null;
+
         try {
-            const editUidStr = String(state.editingUid);
+            const editUidStr = String(effectiveUid);
             const savedBook = await mutateBookAtomically(targetBookId, (freshBook) => {
                 const entries = freshBook.entries;
                 if (isEditingExisting) {
@@ -770,11 +806,10 @@ export function createForgeController(deps) {
                         ? existingEntry.uid
                         : (Number.isNaN(Number(editUidStr)) ? editUidStr : Number(editUidStr));
 
-                    const baseSnap = state.entryBaseSnapshot;
                     const serverSnap = normalizeEntryEditableSnapshot(existingEntry);
                     const draftSnap = normalizeEntryEditableSnapshot({
                         ...cleanDraft,
-                        key: state.entryKeysDirty
+                        key: keysDirty
                             ? parseSmartTriggerKeys(cleanDraft.key)
                             : (baseSnap ? baseSnap.key : existingEntry.key),
                     });
@@ -791,7 +826,7 @@ export function createForgeController(deps) {
                         }
                     }
 
-                    if (state.entryKeysDirty) {
+                    if (keysDirty) {
                         const userChangedKeys = !baseSnap || !shallowEqualField(draftSnap.key, baseSnap.key);
                         if (userChangedKeys) {
                             editablePatch.key = draftSnap.key;
@@ -803,8 +838,10 @@ export function createForgeController(deps) {
 
                     if (conflictingFields.length > 0) {
                         const conflictSig = JSON.stringify({ uid: editUidStr, serverSnap, draftSnap });
-                        if (state.entryConflictForceHash !== conflictSig) {
-                            state.entryConflictForceHash = conflictSig;
+                        if (forceHash !== conflictSig) {
+                            if (state.entrySessionId === usedSessionId) {
+                                state.entryConflictForceHash = conflictSig;
+                            }
                             throw new Error(tUi(
                                 uiLang,
                                 `Конфликт версий (#${editUidStr}): поле (${conflictingFields.join(', ')}) было одновременно изменено во внешнем редакторе. Черновик сохранён — нажмите «Сохранить» повторно, чтобы применить вашу правку поверх внешней.`,
@@ -815,25 +852,44 @@ export function createForgeController(deps) {
 
                     entries[editUidStr] = { ...existingEntry, ...editablePatch, uid: preservedUid };
                 } else {
-                    const parsedNewKeys = (!state.entryKeysDirty && Array.isArray(state.entryOriginalKeys) && state.entryOriginalKeys.length > 0)
-                        ? [...state.entryOriginalKeys]
+                    const parsedNewKeys = (!keysDirty && Array.isArray(origKeys) && origKeys.length > 0)
+                        ? [...origKeys]
                         : parseSmartTriggerKeys(cleanDraft.key);
                     const uids = Object.keys(entries).map(Number).filter(n => !Number.isNaN(n));
                     const nextUid = uids.length > 0 ? (Math.max(...uids) + 1) : 0;
-                    entries[String(nextUid)] = makeStandardWiEntry(nextUid, { ...cleanDraft, keys: parsedNewKeys }, stApi.worldInfoMod?.newWorldInfoEntryTemplate);
+                    createdUidStr = String(nextUid);
+                    entries[createdUidStr] = makeStandardWiEntry(nextUid, { ...cleanDraft, keys: parsedNewKeys }, stApi.worldInfoMod?.newWorldInfoEntryTemplate);
                 }
             });
-            state.activeBookId = targetBookId;
-            state.activeBookData = savedBook;
-            state.editingOriginBookId = '';
-            state.entryBaseSnapshot = null;
-            state.entryConflictForceHash = '';
-            state.screen = 'book_entries';
+
+            state.bookCounts[targetBookId] = Object.keys(savedBook.entries || {}).length;
+
+            if (state.entrySessionId === usedSessionId) {
+                if (createdUidStr !== null) {
+                    state.entryCreatedUid = createdUidStr;
+                    state.editingUid = createdUidStr;
+                }
+                state.activeBookId = targetBookId;
+                state.activeBookData = savedBook;
+                state.editingOriginBookId = '';
+                state.entryBaseSnapshot = null;
+                state.entryConflictForceHash = '';
+                state.screen = 'book_entries';
+            } else if (state.activeBookId === targetBookId && state.screen !== 'entry_edit') {
+                state.activeBookData = savedBook;
+            }
             return true;
         } catch (err) {
-            state.saveError = err?.message || String(err);
-            try { window.toastr?.warning?.(state.saveError); } catch {}
+            const msg = err?.message || String(err);
+            if (state.entrySessionId === usedSessionId) {
+                state.saveError = msg;
+            }
+            try { window.toastr?.warning?.(msg); } catch {}
             return false;
+        } finally {
+            if (!isBackgroundPinned) {
+                state.entrySavingBusy = false;
+            }
         }
     }
 
@@ -841,6 +897,8 @@ export function createForgeController(deps) {
         const d = state.entryDraft;
         if (!d || !String(d.content || '').trim() || state.keysGenerating) return;
         const reqSeq = ++forgeAiSeq;
+        const epochAtStart = chatEpoch;
+        const sessionAtStart = state.entrySessionId;
         const chatAtStart = stApi.ctx?.getCurrentChatId?.() || stApi.ctx?.chatId || '';
         state.keysGenerating = true;
         requestRender({ preserveBodyScroll: true });
@@ -850,7 +908,7 @@ export function createForgeController(deps) {
             const sys = `Ты — мастер ключевых слов для интерактивных Лорбуков. Прочитай готовую статью и подбери 4–7 точных ключевых слов-триггеров на языке "${lang}" (имена собственные, локации, предметы, короткие корни без общих бытовых слов). Также предложи короткое название страницы (2–4 слова) в поле "comment". Верни строго JSON: { "comment": "...", "keys": ["..."] }.`;
             const usr = `[Название сейчас]: ${d.comment || '(пусто)'}\n[Текст страницы]:\n${d.content.trim()}`;
             const raw = await callForgeModel(sys, usr, KEYS_ONLY_JSON_SCHEMA, 1200);
-            if (reqSeq !== forgeAiSeq || (stApi.ctx?.getCurrentChatId?.() || stApi.ctx?.chatId || '') !== chatAtStart) return;
+            if (reqSeq !== forgeAiSeq || epochAtStart !== chatEpoch || state.entrySessionId !== sessionAtStart || (stApi.ctx?.getCurrentChatId?.() || stApi.ctx?.chatId || '') !== chatAtStart) return;
             const parsed = parseJsonObjectFromModel(raw, 'keys');
             const newKeys = parseSmartTriggerKeys(parsed?.keys);
             if (!newKeys.length) {
@@ -861,9 +919,11 @@ export function createForgeController(deps) {
             state.entryKeysDirty = true;
             if (!String(d.comment || '').trim() && parsed?.comment) d.comment = String(parsed.comment).trim();
         } catch (err) {
-            window.alert('Ошибка подбора ключей: ' + (err?.message || String(err)));
+            if (state.entrySessionId === sessionAtStart) {
+                window.alert('Ошибка подбора ключей: ' + (err?.message || String(err)));
+            }
         } finally {
-            if (reqSeq === forgeAiSeq) {
+            if (state.entrySessionId === sessionAtStart && reqSeq === forgeAiSeq) {
                 state.keysGenerating = false;
                 requestRender({ preserveBodyScroll: true });
             }
@@ -898,7 +958,7 @@ export function createForgeController(deps) {
     }
 
     async function runSinglePageAiGeneration({ isRefinement = false, directSave = false } = {}) {
-        if (state.pageAiGenerating) return;
+        if (state.pageAiGenerating || state.entrySavingBusy) return;
         const s = ensureSettings();
         const uiLang = s.uiLang || 'ru';
         const d = state.entryDraft;
@@ -911,7 +971,31 @@ export function createForgeController(deps) {
         }
 
         const reqSeq = ++forgeAiSeq;
+        const epochAtStart = chatEpoch;
+        const sessionAtStart = state.entrySessionId;
         const chatAtStart = stApi.ctx?.getCurrentChatId?.() || stApi.ctx?.chatId || '';
+        const draftSnapshot = JSON.parse(JSON.stringify(d || {}));
+        const taskAtStart = state.pageAiTask;
+        const refineAtStart = state.pageAiRefineText;
+        const matchFormatAtStart = state.pageAiMatchFormat;
+        const useCharAtStart = state.pageAiUseChar;
+        const usePersonaAtStart = state.pageAiUsePersona;
+        const useChatAtStart = state.pageAiUseChat;
+
+        const pinnedEditingUid = state.editingUid !== null ? state.editingUid : state.entryCreatedUid;
+        const pinnedTargetBookId = pinnedEditingUid !== null
+            ? (state.editingOriginBookId || state.entryTargetBookId || state.activeBookId)
+            : (state.entryTargetBookId || state.activeBookId);
+        const pinnedSaveCtx = {
+            sessionId: sessionAtStart,
+            editingUid: pinnedEditingUid,
+            targetBookId: pinnedTargetBookId,
+            baseSnapshot: state.entryBaseSnapshot ? JSON.parse(JSON.stringify(state.entryBaseSnapshot)) : null,
+            keysDirty: true,
+            originalKeys: Array.isArray(state.entryOriginalKeys) ? [...state.entryOriginalKeys] : [],
+            conflictForceHash: state.entryConflictForceHash || '',
+        };
+
         state.pageAiGenerating = true;
         state.pageAiStatus = directSave
             ? tUi(uiLang, 'Куём и сразу сохраняем страницу в Лорбук...', 'Forging and saving page to Lorebook...')
@@ -931,30 +1015,32 @@ export function createForgeController(deps) {
                 .replace(/\{\{word_limit\}\}/gi, wordLim);
 
             const blocks = [];
-            if (state.pageAiMatchFormat && state.entryTargetBookId) {
+            if (matchFormatAtStart && pinnedTargetBookId) {
                 try {
-                    const bookObj = (state.entryTargetBookId === state.activeBookId && state.activeBookData)
+                    const bookObj = (pinnedTargetBookId === state.activeBookId && state.activeBookData)
                         ? state.activeBookData
-                        : await loadBookData(state.entryTargetBookId);
+                        : await loadBookData(pinnedTargetBookId);
                     const fmtHint = extractBookFormatSkeleton(bookObj);
                     if (fmtHint) blocks.push(fmtHint);
                 } catch {}
             }
-            if (state.pageAiUseChar) { const cd = getCharacterDescriptionText(); if (cd) blocks.push(cd); }
-            if (state.pageAiUsePersona) { const pd = getUserPersonaDescriptionText(); if (pd) blocks.push(pd); }
-            if (state.pageAiUseChat) { const ct = buildChatContextSnippet(s.aiChatRadius ?? 10); if (ct) blocks.push(ct); }
+            if (useCharAtStart) { const cd = getCharacterDescriptionText(); if (cd) blocks.push(cd); }
+            if (usePersonaAtStart) { const pd = getUserPersonaDescriptionText(); if (pd) blocks.push(pd); }
+            if (useChatAtStart) { const ct = buildChatContextSnippet(s.aiChatRadius ?? 10); if (ct) blocks.push(ct); }
 
             if (isRefinement && prevCand) {
-                blocks.push(`[Исходный замысел]\n${state.pageAiTask.trim() || '(доработка черновика)'}`);
+                blocks.push(`[Исходный замысел]\n${taskAtStart.trim() || '(доработка черновика)'}`);
                 blocks.push(`[Предыдущий вариант]\nНазвание: ${prevCand.comment}\nКлючи: ${prevCand.keys}\nТекст:\n${prevCand.content}`);
-                blocks.push(`[Что изменить]\n${state.pageAiRefineText.trim()}`);
+                blocks.push(`[Что изменить]\n${refineAtStart.trim()}`);
             } else {
-                if (d?.content && d.content.trim()) blocks.push(`[Черновик в редакторе]\n${d.content.trim()}`);
-                blocks.push(`[Запрос автора для новой страницы Лорбука]\n${state.pageAiTask.trim() || 'Развей черновик в полноценную оригинальную страницу Лорбука с абзацами и подбери ключи.'}`);
+                if (draftSnapshot?.content && draftSnapshot.content.trim()) blocks.push(`[Черновик в редакторе]\n${draftSnapshot.content.trim()}`);
+                blocks.push(`[Запрос автора для новой страницы Лорбука]\n${taskAtStart.trim() || 'Развей черновик в полноценную оригинальную страницу Лорбука с абзацами и подбери ключи.'}`);
             }
 
             const raw = await callForgeModel(sysPrompt, blocks.join('\n\n'), SINGLE_PAGE_JSON_SCHEMA, Math.max(1200, Number(s.aiMaxTokens) || 3400));
-            if (reqSeq !== forgeAiSeq || (stApi.ctx?.getCurrentChatId?.() || stApi.ctx?.chatId || '') !== chatAtStart) return;
+            if (epochAtStart !== chatEpoch || (stApi.ctx?.getCurrentChatId?.() || stApi.ctx?.chatId || '') !== chatAtStart) return;
+            if (!directSave && (reqSeq !== forgeAiSeq || state.entrySessionId !== sessionAtStart)) return;
+
             const parsed = parseJsonObjectFromModel(raw, 'page');
             const rawBody = typeof parsed?.content === 'string' ? parsed.content : '';
             const cleanBody = formatCleanParagraphs(rawBody);
@@ -965,24 +1051,29 @@ export function createForgeController(deps) {
             const genKeysArr = parseSmartTriggerKeys(parsed.keys);
 
             if (directSave) {
-                d.comment = String(parsed.comment || d.comment || 'Новая страница').trim();
-                d.key = genKeysArr;
-                state.entryKeysRawText = genKeysArr.join(', ');
-                state.entryKeysDirty = true;
-                d.content = cleanBody;
-                d.constant = Boolean(parsed.constant);
-                const ok = await saveDraftToTargetBook(d);
-                if (ok) {
-                    state.pageAiTask = '';
-                } else {
-                    state.pageAiCandidates.push({
-                        comment: d.comment,
-                        keys: genKeysArr.join(', '),
-                        content: cleanBody,
-                        constant: Boolean(parsed.constant),
-                    });
-                    state.pageAiCandIdx = state.pageAiCandidates.length - 1;
-                    state.pageAiStatus = 'Ошибка сохранения: ' + state.saveError;
+                const payloadDraft = state.entrySessionId === sessionAtStart ? d : draftSnapshot;
+                payloadDraft.comment = String(parsed.comment || payloadDraft.comment || 'Новая страница').trim();
+                payloadDraft.key = genKeysArr;
+                payloadDraft.content = cleanBody;
+                payloadDraft.constant = Boolean(parsed.constant);
+                if (state.entrySessionId === sessionAtStart) {
+                    state.entryKeysRawText = genKeysArr.join(', ');
+                    state.entryKeysDirty = true;
+                }
+                const ok = await saveDraftToTargetBook(payloadDraft, pinnedSaveCtx);
+                if (state.entrySessionId === sessionAtStart) {
+                    if (ok) {
+                        state.pageAiTask = '';
+                    } else {
+                        state.pageAiCandidates.push({
+                            comment: payloadDraft.comment,
+                            keys: genKeysArr.join(', '),
+                            content: cleanBody,
+                            constant: Boolean(parsed.constant),
+                        });
+                        state.pageAiCandIdx = state.pageAiCandidates.length - 1;
+                        state.pageAiStatus = 'Ошибка сохранения: ' + state.saveError;
+                    }
                 }
                 return;
             }
@@ -997,12 +1088,14 @@ export function createForgeController(deps) {
             if (isRefinement) state.pageAiRefineText = '';
             state.pageAiStatus = tUi(uiLang, 'Вариант готов! Проверь отступы и ключи ниже.', 'Draft ready! Review spacing and trigger keys below.');
         } catch (err) {
-            if (reqSeq === forgeAiSeq) {
+            if (state.entrySessionId === sessionAtStart && epochAtStart === chatEpoch) {
                 state.pageAiStatus = 'Ошибка: ' + (err?.message || String(err));
             }
         } finally {
-            if (reqSeq === forgeAiSeq) {
+            if (state.entrySessionId === sessionAtStart) {
                 state.pageAiGenerating = false;
+                requestRender({ preserveBodyScroll: true });
+            } else if (directSave && state.screen !== 'entry_edit') {
                 requestRender({ preserveBodyScroll: true });
             }
         }
@@ -1028,13 +1121,32 @@ export function createForgeController(deps) {
 
         // In verbatim_keys mode, NEVER silently send hidden chat/character switches — only send the verbatim items!
         if (state.wizMode === 'ai_adapt') {
-            if (state.wizUseChar) { const cd = getCharacterDescriptionText(); if (cd) sourceBlocks.push(cd); }
+            if (state.wizUseChar) {
+                // Exclude scenario inside character card block so wizUseScenario controls scenario strictly!
+                const cd = getCharacterDescriptionText({ includeScenario: false });
+                if (cd) sourceBlocks.push(cd);
+            }
             if (state.wizUseScenario) {
                 const ctx = stApi.ctx;
-                const ch = (ctx.characterId !== undefined && Array.isArray(ctx.characters)) ? ctx.characters[ctx.characterId] : null;
-                const scen = ch?.scenario || ch?.data?.scenario || '';
-                const firstMes = ch?.first_mes || '';
-                if (scen || firstMes) sourceBlocks.push(`[Сценарий и завязка]\n${scen}\n${firstMes}`.trim());
+                const chars = Array.isArray(ctx.characters) ? ctx.characters : [];
+                const scenParts = [];
+                if (ctx.groupId && Array.isArray(ctx.groups)) {
+                    const grp = ctx.groups.find(g => String(g.id) === String(ctx.groupId));
+                    if (grp && Array.isArray(grp.members)) {
+                        for (const av of grp.members.slice(0, 5)) {
+                            const mCh = chars.find(c => c.avatar === av);
+                            const mScen = (mCh?.scenario || mCh?.data?.scenario || '').trim();
+                            if (mScen) scenParts.push(`${mCh.name || 'Персонаж'}: ${mScen}`);
+                        }
+                    }
+                } else {
+                    const ch = (ctx.characterId !== undefined && ctx.characterId !== null) ? chars[ctx.characterId] : null;
+                    const scen = (ch?.scenario || ch?.data?.scenario || '').trim();
+                    const firstMes = (ch?.first_mes || '').trim();
+                    if (scen) scenParts.push(scen);
+                    if (firstMes) scenParts.push(firstMes);
+                }
+                if (scenParts.length) sourceBlocks.push(`[Сценарий и завязка]\n${scenParts.join('\n\n')}`);
             }
             if (state.wizUsePersona) { const pd = getUserPersonaDescriptionText(); if (pd) sourceBlocks.push(pd); }
             if (state.wizUseChat) { const ct = buildChatContextSnippet(state.wizChatCount); if (ct) sourceBlocks.push(ct); }
@@ -1075,6 +1187,7 @@ export function createForgeController(deps) {
     }
 
     async function executeAutoForge({ directCommit = false } = {}) {
+        if (state.wizForging || state.commitSavingBusy) return;
         const s = ensureSettings();
         const uiLang = s.uiLang || 'ru';
         const originSession = {
@@ -1082,6 +1195,10 @@ export function createForgeController(deps) {
             bindScope: state.bindAfterScope,
             muteCats: Boolean(state.wizMuteExportedCats),
             selectedCatIds: Object.keys(state.wizSelectedCats).filter(k => state.wizSelectedCats[k]),
+            targetBookMode: state.targetBookMode,
+            targetBookName: state.targetBookName,
+            targetExistingId: state.targetExistingId,
+            targetCover: state.targetCover,
         };
         state.wizOriginSession = originSession;
         const { sysPrompt, userPrompt, verbatimItems } = buildDynamicForgePrompts();
@@ -1192,11 +1309,14 @@ export function createForgeController(deps) {
     }
 
     async function commitApprovedLorebook(explicitOriginSession = null) {
+        if (state.commitSavingBusy) return false;
         const uiLang = ensureSettings().uiLang || 'ru';
         const chosenItems = state.stagedEntries.filter(e => e.included && String(e.content || '').trim());
-        if (chosenItems.length === 0) return;
+        if (chosenItems.length === 0) return false;
 
-        const session = (explicitOriginSession && explicitOriginSession.anchor)
+        state.commitSavingBusy = true;
+        const isPinnedDirect = Boolean(explicitOriginSession && explicitOriginSession.anchor);
+        const session = isPinnedDirect
             ? explicitOriginSession
             : (state.wizOriginSession || {
                 anchor: captureContextAnchor(),
@@ -1205,14 +1325,19 @@ export function createForgeController(deps) {
                 selectedCatIds: Object.keys(state.wizSelectedCats).filter(k => state.wizSelectedCats[k]),
             });
 
+        const useTargetMode = isPinnedDirect && session.targetBookMode ? session.targetBookMode : state.targetBookMode;
+        const useTargetExisting = isPinnedDirect && session.targetExistingId !== undefined ? session.targetExistingId : state.targetExistingId;
+        const useTargetName = isPinnedDirect && session.targetBookName !== undefined ? session.targetBookName : state.targetBookName;
+        const useTargetCover = isPinnedDirect && session.targetCover !== undefined ? session.targetCover : state.targetCover;
+
         try {
             let fileId = '';
             let confirmedExistingMerge = false;
-            if (state.targetBookMode === 'existing' && state.targetExistingId) {
-                fileId = state.targetExistingId;
+            if (useTargetMode === 'existing' && useTargetExisting) {
+                fileId = useTargetExisting;
                 confirmedExistingMerge = true;
             } else {
-                const rawName = (state.targetBookName || '').trim() || ('Lorebook_' + (stApi.ctx.name2 || 'World'));
+                const rawName = (useTargetName || '').trim() || ('Lorebook_' + (stApi.ctx.name2 || 'World'));
                 const sanitized = rawName.replace(/[<>:"/\\|?*]/g, '_');
                 // Strict list check — throws and aborts if /api/worldinfo/list fails (e.g. HTTP 503)!
                 const liveList = await fetchBooksList({ strict: true });
@@ -1223,7 +1348,7 @@ export function createForgeController(deps) {
                         `Лорбук «${matched.file_id}» уже существует! Дописать новые страницы в конец книги «${matched.file_id}» (ОК) или отменить (Отмена)?`,
                         `Lorebook "${matched.file_id}" already exists! Append new pages to "${matched.file_id}" (OK) or cancel (Cancel)?`,
                     ));
-                    if (!mergeOk) return;
+                    if (!mergeOk) return false;
                     fileId = matched.file_id;
                     confirmedExistingMerge = true;
                 } else {
@@ -1231,11 +1356,11 @@ export function createForgeController(deps) {
                 }
             }
 
-            const existingCheck = confirmedExistingMerge || state.books.some(b => b.file_id === fileId) || (state.targetBookMode === 'existing');
+            const existingCheck = confirmedExistingMerge || state.books.some(b => b.file_id === fileId) || (useTargetMode === 'existing');
             const wiTpl = stApi.worldInfoMod?.newWorldInfoEntryTemplate;
             let savedData = null;
 
-            const safeTargetCover = sanitizeCoverDataUrl(state.targetCover);
+            const safeTargetCover = sanitizeCoverDataUrl(useTargetCover);
             if (existingCheck) {
                 savedData = await mutateBookAtomically(fileId, (workingCopy) => {
                     if (safeTargetCover) {
@@ -1320,6 +1445,8 @@ export function createForgeController(deps) {
             window.alert(msg);
             requestRender({ preserveBodyScroll: true });
             return false;
+        } finally {
+            state.commitSavingBusy = false;
         }
     }
 
@@ -1559,7 +1686,7 @@ export function createForgeController(deps) {
                             </div>`;
                         }).join('')}
                     </div>
-                    <div style="display:flex;justify-content:flex-end;"><button type="button" class="pcx-primary-btn" id="pcx-fg-commit-btn">${ICONS.check}<span>Сохранить в Лорбук</span></button></div>
+                    <div style="display:flex;justify-content:flex-end;"><button type="button" class="pcx-primary-btn" id="pcx-fg-commit-btn" ${state.commitSavingBusy ? 'disabled' : ''}>${ICONS.check}<span>Сохранить в Лорбук</span></button></div>
                 </div>`;
         }
 
@@ -1584,7 +1711,7 @@ export function createForgeController(deps) {
                         <textarea id="pcx-fgc-refine" class="pcx-textarea" style="min-height:52px" placeholder="Если нужно что-то поправить — напиши сюда и нажми «Переделать»...">${escapeHtml(state.pageAiRefineText || '')}</textarea>
                         <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">
                             <button type="button" id="pcx-fgc-run-refine" class="pcx-secondary-btn" ${state.pageAiGenerating ? 'disabled' : ''}>${state.pageAiGenerating ? ICONS.spinner : ICONS.spark}<span>Переделать</span></button>
-                            <button type="button" id="pcx-fgc-save-now" class="pcx-primary-btn">${ICONS.check}<span>Сохранить в Лорбук</span></button>
+                            <button type="button" id="pcx-fgc-save-now" class="pcx-primary-btn" ${state.entrySavingBusy ? 'disabled' : ''}>${ICONS.check}<span>Сохранить в Лорбук</span></button>
                         </div>
                     </div>
                 </div>`;
@@ -1715,7 +1842,7 @@ export function createForgeController(deps) {
                                 <label class="pcx-check-item"><input type="checkbox" id="pcx-fge-exclrec" ${d.excludeRecursion ? 'checked' : ''}><span>Срабатывать только от чата (не от других страниц)</span></label>
                             </div>
                         </div>
-                        <div style="display:flex;justify-content:flex-end;gap:8px;"><button type="button" class="pcx-icon-btn" id="pcx-fge-cancel-2">Отмена</button><button type="button" class="pcx-primary-btn" id="pcx-fge-save">${ICONS.check}<span>Сохранить страницу</span></button></div>
+                        <div style="display:flex;justify-content:flex-end;gap:8px;"><button type="button" class="pcx-icon-btn" id="pcx-fge-cancel-2">Отмена</button><button type="button" class="pcx-primary-btn" id="pcx-fge-save" ${state.entrySavingBusy ? 'disabled' : ''}>${ICONS.check}<span>Сохранить страницу</span></button></div>
                     `}
                 </div>`;
         }
@@ -2075,8 +2202,10 @@ export function createForgeController(deps) {
         }));
 
         win.querySelector('#pcx-fg-undo-del')?.addEventListener('click', async () => {
+            if (state.undoBusy) return;
             const last = state.lastDeletedEntry;
             if (!last || !last.bookId || !last.entry) return;
+            state.undoBusy = true;
             try {
                 await mutateBookAtomically(last.bookId, (fresh) => {
                     const desiredKey = String(last.uid);
@@ -2091,10 +2220,13 @@ export function createForgeController(deps) {
                 state.lastDeletedEntry = null;
                 requestRender({ preserveBodyScroll: true });
             } catch (err) { window.alert(err?.message || String(err)); }
+            finally { state.undoBusy = false; }
         });
 
         win.querySelector('#pcx-fg-create-manual-confirm')?.addEventListener('click', async () => {
+            if (state.manualCreateBusy) return;
             const name = (state.newBookName || '').trim(); if (!name) return;
+            state.manualCreateBusy = true;
             const uiLang = s.uiLang || 'ru';
             const sanitized = name.replace(/[<>:"/\\|?*]/g, '_');
             const originAnchor = captureContextAnchor();
@@ -2160,6 +2292,8 @@ export function createForgeController(deps) {
                 try { window.toastr?.error?.(msg); } catch {}
                 window.alert(msg);
                 requestRender({ preserveBodyScroll: true });
+            } finally {
+                state.manualCreateBusy = false;
             }
         });
 
@@ -2354,6 +2488,9 @@ export function createForgeController(deps) {
         if (state.screen === 'entry_edit' && state.entryDraft) {
             const d = state.entryDraft;
             const cancelEdit = async () => {
+                state.entrySessionId = ++entrySessionSeq;
+                state.pageAiGenerating = false;
+                state.keysGenerating = false;
                 if (state.activeBookId) {
                     if (!state.activeBookData) state.activeBookData = await loadBookData(state.activeBookId);
                     state.screen = 'book_entries';
@@ -2574,6 +2711,8 @@ export function createForgeController(deps) {
         captureForgeFields: captureEntryFields,
         resetTransientState() {
             forgeAiSeq++;
+            chatEpoch++;
+            state.entrySessionId = ++entrySessionSeq;
             state.saveError = '';
             state.pageAiGenerating = false;
             state.keysGenerating = false;
@@ -2582,6 +2721,6 @@ export function createForgeController(deps) {
         get isEditingForm() {
             return state.screen === 'entry_edit' || state.screen === 'approve' || state.screen === 'new_book' || state.screen === 'wizard';
         },
-        get isBusy() { return state.wizForging || state.pageAiGenerating || state.keysGenerating; },
+        get isBusy() { return state.wizForging || state.pageAiGenerating || state.keysGenerating || state.entrySavingBusy || state.commitSavingBusy || state.manualCreateBusy; },
     };
 }

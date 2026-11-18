@@ -503,12 +503,12 @@ function openImageLightbox(src) {
     (document.getElementById('pcx-dialog') || document.body).appendChild(box);
 }
 
-function formatSingleCharCard(ch, fallbackName) {
+function formatSingleCharCard(ch, fallbackName, { includeScenario = true } = {}) {
     if (!ch) return '';
     const name = ch.name || fallbackName || 'Персонаж';
     const desc = (ch.description || ch.data?.description || '').trim();
     const pers = (ch.personality || ch.data?.personality || '').trim();
-    const scen = (ch.scenario || ch.data?.scenario || '').trim();
+    const scen = includeScenario ? (ch.scenario || ch.data?.scenario || '').trim() : '';
     const parts = [];
     if (desc) parts.push(desc);
     if (pers) parts.push(`Личность: ${pers}`);
@@ -516,7 +516,7 @@ function formatSingleCharCard(ch, fallbackName) {
     return parts.length ? `[Описание персонажа (${name})]\n${parts.join('\n')}` : '';
 }
 
-function getCharacterDescriptionText() {
+function getCharacterDescriptionText({ includeScenario = true } = {}) {
     try {
         const ctx = stApi.ctx;
         const chars = Array.isArray(ctx.characters) ? ctx.characters : [];
@@ -527,13 +527,13 @@ function getCharacterDescriptionText() {
                     .slice(0, 5)
                     .map(av => chars.find(c => c.avatar === av))
                     .filter(Boolean)
-                    .map(ch => formatSingleCharCard(ch, ch.name))
+                    .map(ch => formatSingleCharCard(ch, ch.name, { includeScenario }))
                     .filter(Boolean);
                 if (memberCards.length > 0) return memberCards.join('\n\n');
             }
         }
         if (ctx.characterId !== undefined && ctx.characterId !== null && chars[ctx.characterId]) {
-            return formatSingleCharCard(chars[ctx.characterId], ctx.name2);
+            return formatSingleCharCard(chars[ctx.characterId], ctx.name2, { includeScenario });
         }
         const domDesc = (document.getElementById('description_textarea')?.value || '').trim();
         return domDesc ? `[Описание персонажа (${ctx.name2 || 'Персонаж'})]\n${domDesc}` : '';
@@ -1335,7 +1335,8 @@ function renderModal(opts = {}) {
             });
             const catEnabled = currentCat?.enabled !== false;
             const allCollapsed = catNotes.length > 0 && catNotes.every(n => n.collapsed);
-            const undoHtml = uiState.lastDeletedNote ? `
+            const showUndo = canUndoDeletedNote(uiState.lastDeletedNote, s);
+            const undoHtml = showUndo ? `
                 <div class="pcx-undo-bar">
                     <span>${tUi(uiLang, 'Заметка удалена:', 'Note deleted:')} <b>${escapeHtml(uiState.lastDeletedNote.note.title || tUi(uiLang, 'Без названия', 'Untitled'))}</b></span>
                     <button type="button" class="pcx-mini-btn" id="pcx-note-undo-btn">${ICONS.undo}<span>${tUi(uiLang, 'Вернуть', 'Undo')}</span></button>
@@ -1449,7 +1450,28 @@ function renderModal(opts = {}) {
     }
 }
 
+function getCurrentChatUndoKey() {
+    if (!stApi.isChatOpen()) return '';
+    const c = stApi.ctx || {};
+    const cid = c.getCurrentChatId?.() || c.chatId || '';
+    if (!cid) return '';
+    const charAvatar = (c.characterId !== undefined && c.characterId !== null && Array.isArray(c.characters))
+        ? (c.characters[c.characterId]?.avatar || String(c.characterId))
+        : null;
+    return JSON.stringify([c.groupId ?? null, charAvatar, String(cid)]);
+}
+
+function canUndoDeletedNote(last, s) {
+    if (!last || !last.note) return false;
+    if (last.scope !== s.scope) return false;
+    if (last.scope === 'global') return true;
+    const curKey = getCurrentChatUndoKey();
+    return Boolean(curKey && last.chatKey && last.chatKey === curKey);
+}
+
 function resetEditDrafts() {
+    codexAiSeq++;
+    uiState.aiGenerating = false;
     delete uiState.draftTitle; delete uiState.draftContent; delete uiState.draftIncTitle; delete uiState.draftSubStyle; delete uiState.draftStrict; delete uiState.draftCat;
     uiState.draftAttachments = null; uiState.aiCandidates = []; uiState.aiCandidateIdx = 0; uiState.aiRefinementText = ''; uiState.aiStatus = '';
 }
@@ -1668,8 +1690,12 @@ function bindCommonAndCodexEvents() {
     }));
     win.querySelector('#pcx-note-undo-btn')?.addEventListener('click', () => {
         const last = uiState.lastDeletedNote;
-        if (!last || !last.note) return;
-        const targetStore = last.scope === 'global' ? s.globalData : (getChatStore() || store);
+        if (!canUndoDeletedNote(last, s)) {
+            renderModal({ preserveTabsScroll: true, preserveBodyScroll: true });
+            return;
+        }
+        const targetStore = last.scope === 'global' ? s.globalData : getChatStore();
+        if (!targetStore || !Array.isArray(targetStore.notes)) return;
         if (!targetStore.notes.some(n => n.id === last.note.id)) {
             targetStore.notes.unshift(last.note);
             normalizeStore(targetStore);
@@ -1752,7 +1778,7 @@ function bindCommonAndCodexEvents() {
         if (ex) {
             Object.assign(ex, { categoryId: catId, priority: prio, title, includeTitle: incTitle, forceHideTitle, subHeaderStyle: subSt, content, attachments: atts });
         } else {
-            store.notes.unshift({ id: 'note_' + Date.now(), categoryId: catId, priority: prio, title, includeTitle: incTitle, forceHideTitle, subHeaderStyle: subSt, collapsed: false, content, attachments: atts, enabled: true });
+            store.notes.unshift({ id: 'note_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6), categoryId: catId, priority: prio, title, includeTitle: incTitle, forceHideTitle, subHeaderStyle: subSt, collapsed: false, content, attachments: atts, enabled: true });
         }
         s.activeTab = catId; resetEditDrafts(); uiState.view = 'notes'; uiState.editingNoteId = null; saveAll(); renderModal({ preserveTabsScroll: true });
     });
@@ -1785,7 +1811,11 @@ function bindCommonAndCodexEvents() {
         const uiLang = s.uiLang || 'ru';
         const label = target.title || (target.content || '').slice(0, 32) || '#';
         if (!window.confirm(tUi(uiLang, `Удалить заметку «${label}»?`, `Delete note "${label}"?`))) return;
-        uiState.lastDeletedNote = { scope: s.scope, note: JSON.parse(JSON.stringify(target)) };
+        uiState.lastDeletedNote = {
+            scope: s.scope,
+            chatKey: s.scope === 'chat' ? getCurrentChatUndoKey() : null,
+            note: JSON.parse(JSON.stringify(target)),
+        };
         store.notes = store.notes.filter(n => n.id !== el.dataset.id);
         saveAll();
         renderModal({ preserveTabsScroll: true, preserveBodyScroll: true });

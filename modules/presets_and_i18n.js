@@ -68,12 +68,41 @@ export function parseSmartTriggerKeys(rawInput) {
 }
 
 export function isSchemaUnsupportedError(err) {
-    const msg = String(err?.message || err || '').toLowerCase();
-    if (!msg) return false;
-    if (/(429|rate limit|quota|502|503|504|timeout|timed out|eof|network|fetch failed|aborted|unauthorized|401|403|unavailable)/i.test(msg)) {
+    const pieces = [];
+    const statuses = [];
+    const seen = new Set();
+    let cur = err;
+    for (let depth = 0; depth < 8 && cur !== undefined && cur !== null; depth++) {
+        if (typeof cur === 'object') {
+            if (seen.has(cur)) break;
+            seen.add(cur);
+            for (const key of ['message', 'details', 'statusText', 'code', 'type', 'body']) {
+                if (typeof cur[key] === 'string' && cur[key].trim()) {
+                    pieces.push(cur[key]);
+                } else if (cur[key] && typeof cur[key] === 'object') {
+                    try { pieces.push(JSON.stringify(cur[key])); } catch {}
+                }
+            }
+            const st = Number(cur.status ?? cur.statusCode ?? cur.response?.status);
+            if (Number.isInteger(st) && st > 0) statuses.push(st);
+            cur = cur.cause ?? cur.error ?? cur.originalError ?? cur.data ?? null;
+        } else {
+            pieces.push(String(cur));
+            break;
+        }
+    }
+    const combined = pieces.join('\n').toLowerCase();
+    if (!combined && statuses.length === 0) return false;
+    if (statuses.some(s => [401, 403, 408, 429, 500, 502, 503, 504].includes(s))) {
         return false;
     }
-    return /(json_schema|response_format|schema|structured|invalid_argument|400|unsupported|unrecognized|not supported)/i.test(msg);
+    if (/(429|rate limit|quota|502|503|504|timeout|timed out|eof|network|fetch failed|aborted|unauthorized|401|403|unavailable)/i.test(combined)) {
+        return false;
+    }
+    if (statuses.some(s => s === 400 || s === 422)) {
+        return true;
+    }
+    return /(json_schema|response_format|schema|structured|invalid_argument|400|422|unsupported|unrecognized|not supported|unknown field|extra_forbidden|additional properties)/i.test(combined);
 }
 
 export function unwrapAndParseModelJson(raw, expectedKind = 'any') {
