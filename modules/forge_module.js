@@ -462,7 +462,8 @@ export function createForgeController(deps) {
         return data;
     }
 
-    async function saveBookData(fileId, data) {
+    async function saveBookData(fileId, data, { refreshList = false } = {}) {
+        const isNewBookFile = refreshList || !state.books.some(b => b.file_id === fileId);
         const payload = JSON.parse(JSON.stringify(normalizeLoadedEntries(data)));
         savingBooksNow.add(fileId);
         try {
@@ -476,7 +477,7 @@ export function createForgeController(deps) {
             state.bookCounts[fileId] = Object.keys(payload.entries || {}).length;
             state.saveError = '';
             await stApi.syncWorldInfoAfterSave?.(fileId, payload);
-            await stApi.refreshWorldInfoUI();
+            if (isNewBookFile) await stApi.refreshWorldInfoUI();
             return payload;
         } finally {
             savingBooksNow.delete(fileId);
