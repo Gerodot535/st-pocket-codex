@@ -143,20 +143,22 @@ async function initStApi() {
         },
         saveSettings() { const fn = this.ctx.saveSettingsDebounced || scriptMod.saveSettingsDebounced; if (typeof fn === 'function') fn(); },
         saveMetadata() {
-            if (!this.isChatOpen()) return;
+            if (!this.isChatOpen()) return Promise.resolve(false);
             const debouncedFn = this.ctx.saveMetadataDebounced || extMod.saveMetadataDebounced;
             if (typeof debouncedFn === 'function') {
-                Promise.resolve().then(() => debouncedFn()).catch((err) => {
+                return Promise.resolve().then(() => debouncedFn()).then(() => true).catch((err) => {
                     console.warn('[PocketCodex] saveMetadataDebounced warning:', err);
+                    return false;
                 });
-                return;
             }
             const immediateFn = this.ctx.saveMetadata || extMod.saveMetadata;
             if (typeof immediateFn === 'function') {
-                Promise.resolve().then(() => immediateFn()).catch((err) => {
+                return Promise.resolve().then(() => immediateFn()).then(() => true).catch((err) => {
                     console.warn('[PocketCodex] saveMetadata warning:', err);
+                    return false;
                 });
             }
+            return Promise.resolve(false);
         },
         setPrompt(key, value, pos, depth, scan, role) { const fn = this.ctx.setExtensionPrompt || scriptMod.setExtensionPrompt; if (typeof fn === 'function') fn(key, value, pos, depth, scan, role); },
         registerMacro(name, fn) { if (typeof this.ctx.registerMacro === 'function') { try { this.ctx.registerMacro(name, fn); } catch {} } },
@@ -236,7 +238,7 @@ async function initStApi() {
             if (window.jQuery) {
                 window.jQuery('.chat_lorebook_button').toggleClass('world_set', list.length > 0);
             }
-            this.saveMetadata();
+            await this.saveMetadata();
             await this.refreshWorldInfoUI();
             if (typeof worldInfoModRef?.getSortedEntries === 'function') {
                 try { await worldInfoModRef.getSortedEntries(); } catch {}

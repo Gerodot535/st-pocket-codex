@@ -180,6 +180,35 @@ export function sanitizeCoverDataUrl(raw) {
     return SAFE_COVER_DATA_URL_RE.test(trimmed) ? trimmed.replace(/\s+/g, '') : '';
 }
 
+const FORGE_SCALAR_FIELDS = [
+    'comment', 'content', 'constant', 'vectorized',
+    'position', 'depth', 'role', 'outletName',
+    'preventRecursion', 'excludeRecursion',
+];
+
+function normalizeEntryEditableSnapshot(ent = {}) {
+    return {
+        comment: String(ent.comment ?? '').trim().slice(0, 95),
+        content: String(ent.content ?? ''),
+        constant: Boolean(ent.constant),
+        vectorized: Boolean(ent.vectorized),
+        position: parseSafePosition(ent.position, 1),
+        depth: parseSafeDepth(ent.depth, 4),
+        role: Number.isFinite(Number(ent.role)) ? Number(ent.role) : 0,
+        outletName: String(ent.outletName ?? '').trim(),
+        preventRecursion: Boolean(ent.preventRecursion),
+        excludeRecursion: Boolean(ent.excludeRecursion),
+        key: Array.isArray(ent.key) ? ent.key.map(k => String(k)) : parseSmartTriggerKeys(ent.key),
+    };
+}
+
+function shallowEqualField(a, b) {
+    if (Array.isArray(a) && Array.isArray(b)) {
+        return a.length === b.length && a.every((v, idx) => v === b[idx]);
+    }
+    return a === b;
+}
+
 function pluralizePages(n, uiLang = 'ru') {
     if (uiLang === 'en') return n === 1 ? '1 page' : `${n} pages`;
     const mod10 = n % 10, mod100 = n % 100;
@@ -221,6 +250,8 @@ export function createForgeController(deps) {
         // Single-page editor (manual + AI co-author with presets & word limits)
         editingUid: null,
         editingOriginBookId: '',
+        entryBaseSnapshot: null,
+        entryConflictForceHash: '',
         entryOriginalKeys: null,
         entryKeysRawText: '',
         entryKeysDirty: false,
@@ -254,6 +285,7 @@ export function createForgeController(deps) {
         wizMode: 'ai_adapt',
         wizForging: false,
         wizStatus: '',
+        wizOriginSession: null,
 
         stagedEntries: [],
         stagedCollapsed: {},
@@ -467,7 +499,7 @@ export function createForgeController(deps) {
     async function openBookAtomic(fileId) {
         const seq = ++bookLoadSeq;
         state.saveError = '';
-        const data = await loadBookData(fileId);
+        const data = await loadBookData(fileId, { preferCache: false });
         if (seq !== bookLoadSeq) return null;
         state.activeBookId = fileId;
         state.activeBookData = data;
@@ -491,9 +523,9 @@ export function createForgeController(deps) {
 
     async function mutateBookAtomically(fileId, mutatorFn) {
         return enqueueBookWrite(fileId, async () => {
-            const fresh = await loadBookData(fileId);
+            const fresh = await loadBookData(fileId, { preferCache: false });
             const workingCopy = JSON.parse(JSON.stringify(fresh));
-            const resVal = await mutatorFn(workingCopy);
+            const resVal = await mutatorFn(workingCopy, fresh);
             if (resVal === false) return null;
             const saved = await saveBookData(fileId, workingCopy);
             if (state.activeBookId === fileId) {
@@ -526,8 +558,40 @@ export function createForgeController(deps) {
         return Boolean(!c.groupId && c.characterId !== undefined && c.characterId !== null && c.characterId !== '');
     }
 
-    async function applyBindingScope(fileId, scope) {
-        if (!fileId || scope === 'none') return;
+    function captureContextAnchor() {
+        const c = stApi.ctx || {};
+        const chatId = String(c.getCurrentChatId?.() ?? c.chatId ?? '');
+        const charId = c.characterId !== undefined && c.characterId !== null ? String(c.characterId) : '';
+        const groupId = c.groupId ? String(c.groupId) : '';
+        const chatMetaRef = stApi.chatMetadata || null;
+        const storeRef = typeof getActiveStore === 'function' ? getActiveStore() : null;
+        return {
+            isChatOpen: Boolean(stApi.isChatOpen()),
+            chatId,
+            charId,
+            groupId,
+            chatMetaRef,
+            storeRef,
+        };
+    }
+
+    function isSameContextAnchor(anchor) {
+        if (!anchor) return true;
+        const now = captureContextAnchor();
+        if (anchor.isChatOpen !== now.isChatOpen) return false;
+        if (anchor.chatId !== now.chatId) return false;
+        if (anchor.charId !== now.charId) return false;
+        if (anchor.groupId !== now.groupId) return false;
+        if (anchor.chatMetaRef && now.chatMetaRef && anchor.chatMetaRef !== now.chatMetaRef) return false;
+        if (anchor.storeRef && now.storeRef && anchor.storeRef !== now.storeRef) return false;
+        return true;
+    }
+
+    async function applyBindingScope(fileId, scope, expectedAnchor = null) {
+        if (!fileId || scope === 'none') return true;
+        if (expectedAnchor && (scope === 'chat' || scope === 'char') && !isSameContextAnchor(expectedAnchor)) {
+            return false;
+        }
         if (scope === 'global') {
             const globals = stApi.getGlobalLorebooks?.() || [];
             if (!globals.includes(fileId)) await stApi.toggleGlobalLorebook?.(fileId);
@@ -540,6 +604,7 @@ export function createForgeController(deps) {
                 await stApi.toggleCharLorebook?.(fileId);
             }
         }
+        return true;
     }
 
     function scanEntryAgainstRecentChat(ent, bookId = state.activeBookId) {
@@ -659,11 +724,15 @@ export function createForgeController(deps) {
 
         if (uid !== null && sourceBook?.entries?.[uid]) {
             state.entryDraft = JSON.parse(JSON.stringify(sourceBook.entries[uid]));
+            state.entryBaseSnapshot = normalizeEntryEditableSnapshot(sourceBook.entries[uid]);
+            state.entryConflictForceHash = '';
             state.entryOriginalKeys = Array.isArray(state.entryDraft.key) ? [...state.entryDraft.key] : [];
             state.entryKeysRawText = state.entryOriginalKeys.join(', ');
             state.entryKeysDirty = false;
         } else {
             state.entryDraft = makeStandardWiEntry(0, { comment: '', keys: [], content: '', position: 1, depth: 4, outletName: '' }, stApi.worldInfoMod?.newWorldInfoEntryTemplate);
+            state.entryBaseSnapshot = null;
+            state.entryConflictForceHash = '';
             state.entryOriginalKeys = [];
             state.entryKeysRawText = '';
             state.entryKeysDirty = false;
@@ -700,21 +769,50 @@ export function createForgeController(deps) {
                     const preservedUid = existingEntry.uid !== undefined
                         ? existingEntry.uid
                         : (Number.isNaN(Number(editUidStr)) ? editUidStr : Number(editUidStr));
-                    const editablePatch = {
-                        comment: String(cleanDraft.comment ?? '').trim().slice(0, 95),
-                        content: String(cleanDraft.content ?? ''),
-                        constant: Boolean(cleanDraft.constant),
-                        vectorized: Boolean(cleanDraft.vectorized),
-                        position: cleanDraft.position,
-                        depth: cleanDraft.depth,
-                        role: Number.isFinite(Number(cleanDraft.role)) ? Number(cleanDraft.role) : (existingEntry.role ?? 0),
-                        outletName: String(cleanDraft.outletName ?? '').trim(),
-                        preventRecursion: Boolean(cleanDraft.preventRecursion),
-                        excludeRecursion: Boolean(cleanDraft.excludeRecursion),
-                    };
-                    if (state.entryKeysDirty) {
-                        editablePatch.key = parseSmartTriggerKeys(cleanDraft.key);
+
+                    const baseSnap = state.entryBaseSnapshot;
+                    const serverSnap = normalizeEntryEditableSnapshot(existingEntry);
+                    const draftSnap = normalizeEntryEditableSnapshot({
+                        ...cleanDraft,
+                        key: state.entryKeysDirty
+                            ? parseSmartTriggerKeys(cleanDraft.key)
+                            : (baseSnap ? baseSnap.key : existingEntry.key),
+                    });
+
+                    const editablePatch = {};
+                    const conflictingFields = [];
+
+                    for (const field of FORGE_SCALAR_FIELDS) {
+                        const userChanged = !baseSnap || !shallowEqualField(draftSnap[field], baseSnap[field]);
+                        if (!userChanged) continue;
+                        editablePatch[field] = draftSnap[field];
+                        if (baseSnap && !shallowEqualField(serverSnap[field], baseSnap[field]) && !shallowEqualField(serverSnap[field], draftSnap[field])) {
+                            conflictingFields.push(field);
+                        }
                     }
+
+                    if (state.entryKeysDirty) {
+                        const userChangedKeys = !baseSnap || !shallowEqualField(draftSnap.key, baseSnap.key);
+                        if (userChangedKeys) {
+                            editablePatch.key = draftSnap.key;
+                            if (baseSnap && !shallowEqualField(serverSnap.key, baseSnap.key) && !shallowEqualField(serverSnap.key, draftSnap.key)) {
+                                conflictingFields.push('key');
+                            }
+                        }
+                    }
+
+                    if (conflictingFields.length > 0) {
+                        const conflictSig = JSON.stringify({ uid: editUidStr, serverSnap, draftSnap });
+                        if (state.entryConflictForceHash !== conflictSig) {
+                            state.entryConflictForceHash = conflictSig;
+                            throw new Error(tUi(
+                                uiLang,
+                                `Конфликт версий (#${editUidStr}): поле (${conflictingFields.join(', ')}) было одновременно изменено во внешнем редакторе. Черновик сохранён — нажмите «Сохранить» повторно, чтобы применить вашу правку поверх внешней.`,
+                                `Version conflict (#${editUidStr}): field (${conflictingFields.join(', ')}) was concurrently modified externally. Draft preserved — click Save again to apply your changes over the external version.`,
+                            ));
+                        }
+                    }
+
                     entries[editUidStr] = { ...existingEntry, ...editablePatch, uid: preservedUid };
                 } else {
                     const parsedNewKeys = (!state.entryKeysDirty && Array.isArray(state.entryOriginalKeys) && state.entryOriginalKeys.length > 0)
@@ -728,6 +826,8 @@ export function createForgeController(deps) {
             state.activeBookId = targetBookId;
             state.activeBookData = savedBook;
             state.editingOriginBookId = '';
+            state.entryBaseSnapshot = null;
+            state.entryConflictForceHash = '';
             state.screen = 'book_entries';
             return true;
         } catch (err) {
@@ -967,6 +1067,13 @@ export function createForgeController(deps) {
     async function executeAutoForge({ directCommit = false } = {}) {
         const s = ensureSettings();
         const uiLang = s.uiLang || 'ru';
+        const originSession = {
+            anchor: captureContextAnchor(),
+            bindScope: state.bindAfterScope,
+            muteCats: Boolean(state.wizMuteExportedCats),
+            selectedCatIds: Object.keys(state.wizSelectedCats).filter(k => state.wizSelectedCats[k]),
+        };
+        state.wizOriginSession = originSession;
         const { sysPrompt, userPrompt, verbatimItems } = buildDynamicForgePrompts();
 
         if (state.wizMode === 'direct_no_ai') {
@@ -984,7 +1091,7 @@ export function createForgeController(deps) {
             }));
             state.stagedCollapsed = {};
             state.targetBookName = state.targetBookName || ('Lorebook_' + (stApi.ctx.name2 || 'Story'));
-            if (directCommit) { await commitApprovedLorebook(); return; }
+            if (directCommit) { await commitApprovedLorebook(originSession); return; }
             state.screen = 'approve'; state.wizStatus = ''; requestRender(); return;
         }
 
@@ -1058,7 +1165,7 @@ export function createForgeController(deps) {
             state.targetBookName = state.targetBookName || ('Lorebook_' + (stApi.ctx.name2 || 'World'));
             state.wizStatus = '';
             if (directCommit) {
-                await commitApprovedLorebook();
+                await commitApprovedLorebook(originSession);
                 return;
             }
             state.screen = 'approve';
@@ -1074,15 +1181,26 @@ export function createForgeController(deps) {
         }
     }
 
-    async function commitApprovedLorebook() {
+    async function commitApprovedLorebook(explicitOriginSession = null) {
         const uiLang = ensureSettings().uiLang || 'ru';
         const chosenItems = state.stagedEntries.filter(e => e.included && String(e.content || '').trim());
         if (chosenItems.length === 0) return;
 
+        const session = (explicitOriginSession && explicitOriginSession.anchor)
+            ? explicitOriginSession
+            : (state.wizOriginSession || {
+                anchor: captureContextAnchor(),
+                bindScope: state.bindAfterScope,
+                muteCats: Boolean(state.wizMuteExportedCats),
+                selectedCatIds: Object.keys(state.wizSelectedCats).filter(k => state.wizSelectedCats[k]),
+            });
+
         try {
             let fileId = '';
+            let confirmedExistingMerge = false;
             if (state.targetBookMode === 'existing' && state.targetExistingId) {
                 fileId = state.targetExistingId;
+                confirmedExistingMerge = true;
             } else {
                 const rawName = (state.targetBookName || '').trim() || ('Lorebook_' + (stApi.ctx.name2 || 'World'));
                 const sanitized = rawName.replace(/[<>:"/\\|?*]/g, '_');
@@ -1097,12 +1215,13 @@ export function createForgeController(deps) {
                     ));
                     if (!mergeOk) return;
                     fileId = matched.file_id;
+                    confirmedExistingMerge = true;
                 } else {
                     fileId = sanitized;
                 }
             }
 
-            const existingCheck = state.books.some(b => b.file_id === fileId) || (state.targetBookMode === 'existing');
+            const existingCheck = confirmedExistingMerge || state.books.some(b => b.file_id === fileId) || (state.targetBookMode === 'existing');
             const wiTpl = stApi.worldInfoMod?.newWorldInfoEntryTemplate;
             let savedData = null;
 
@@ -1130,25 +1249,53 @@ export function createForgeController(deps) {
                     workingCopy.entries[String(nextUid)] = makeStandardWiEntry(nextUid, item, wiTpl);
                     nextUid++;
                 }
-                savedData = await enqueueBookWrite(fileId, () => saveBookData(fileId, workingCopy, { refreshList: true }));
+                savedData = await enqueueBookWrite(fileId, async () => {
+                    const recheck = await fetchBooksList({ strict: true });
+                    if (recheck.some(b => String(b.file_id).toLowerCase() === fileId.toLowerCase())) {
+                        throw new Error(tUi(
+                            uiLang,
+                            `Конфликт имени: Лорбук «${fileId}» был только что создан в другом окне. Нажмите «Сохранить» ещё раз, чтобы безопасно дописать страницы в конец книги.`,
+                            `Name conflict: Lorebook "${fileId}" was concurrently created in another client. Click Save again to safely append pages.`,
+                        ));
+                    }
+                    return saveBookData(fileId, workingCopy, { refreshList: true });
+                });
             }
-            await applyBindingScope(fileId, state.bindAfterScope);
 
-            const exportedCatIds = Object.keys(state.wizSelectedCats).filter(k => state.wizSelectedCats[k]);
-            if (state.wizMuteExportedCats && exportedCatIds.length > 0) {
-                const store = getActiveStore();
-                for (const cid of exportedCatIds) {
-                    const c = store.categories.find(x => x.id === cid);
-                    if (c) c.enabled = false;
+            let postSaveNotice = '';
+            const contextStillMatches = isSameContextAnchor(session.anchor);
+            if (contextStillMatches) {
+                await applyBindingScope(fileId, session.bindScope, session.anchor);
+                if (session.muteCats && session.selectedCatIds.length > 0 && isSameContextAnchor(session.anchor)) {
+                    const targetStore = session.anchor.storeRef || getActiveStore();
+                    if (targetStore && Array.isArray(targetStore.categories)) {
+                        for (const cid of session.selectedCatIds) {
+                            const c = targetStore.categories.find(x => x.id === cid);
+                            if (c) c.enabled = false;
+                        }
+                        saveAllCodex();
+                    }
                 }
-                saveAllCodex();
+            } else if (session.bindScope !== 'none' || (session.muteCats && session.selectedCatIds.length > 0)) {
+                if (session.bindScope === 'global') {
+                    await applyBindingScope(fileId, 'global');
+                }
+                postSaveNotice = tUi(
+                    uiLang,
+                    `Лорбук «${fileId}» сохранён, но активный чат был переключён во время экспорта: привязка книги и отключение разделов в исходном чате не применялись к новому чату.`,
+                    `Lorebook "${fileId}" was saved, but the active chat changed during export: chat binding and section muting were skipped to protect the current chat.`,
+                );
+                try { window.toastr?.warning?.(postSaveNotice); } catch {}
             }
 
+            state.wizOriginSession = null;
             state.wizUploadedDocs = [];
             state.stagedEntries = [];
             await fetchBooksList();
             state.activeBookId = fileId;
             state.activeBookData = savedData;
+            state.saveError = postSaveNotice;
+            state.wizStatus = postSaveNotice;
             state.screen = 'book_entries';
             requestRender();
         } catch (err) {
@@ -1596,6 +1743,7 @@ export function createForgeController(deps) {
 
             return `
                 <div class="pcx-panel-box" style="padding:11px 12px;gap:9px;">
+                    ${state.saveError ? `<div class="pcx-err-banner"><span>${escapeHtml(state.saveError)}</span></div>` : ''}
                     <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">
                         <div style="display:flex;align-items:center;gap:8px;min-width:0;">
                             <button type="button" class="pcx-mini-btn" id="pcx-fg-back-shelf">${ICONS.chevLeft}<span>${tUi(uiLang, 'Полка', 'Shelf')}</span></button>
@@ -1929,6 +2077,8 @@ export function createForgeController(deps) {
             const name = (state.newBookName || '').trim(); if (!name) return;
             const uiLang = s.uiLang || 'ru';
             const sanitized = name.replace(/[<>:"/\\|?*]/g, '_');
+            const originAnchor = captureContextAnchor();
+            const originScope = state.newBookBindScope;
             try {
                 // Strict check — halts if /api/worldinfo/list fails (503) so we never overwrite blindly!
                 const liveList = await fetchBooksList({ strict: true });
@@ -1941,7 +2091,7 @@ export function createForgeController(deps) {
                         `Lorebook "${exactId}" already exists! Open the existing tome safely without erasing it (OK) or cancel (Cancel)?`,
                     ));
                     if (!openOk) return;
-                    let existingData = await loadBookData(exactId);
+                    let existingData = await loadBookData(exactId, { preferCache: false });
                     const safeNewCover = sanitizeCoverDataUrl(state.newBookCover);
                     if (safeNewCover) {
                         existingData = await mutateBookAtomically(exactId, (fresh) => {
@@ -1949,17 +2099,41 @@ export function createForgeController(deps) {
                             fresh.extensions.pocket_codex_cover = safeNewCover;
                         });
                     }
-                    await applyBindingScope(exactId, state.newBookBindScope);
+                    if (isSameContextAnchor(originAnchor)) {
+                        await applyBindingScope(exactId, originScope, originAnchor);
+                    }
                     state.activeBookId = exactId; state.activeBookData = existingData; state.screen = 'book_entries'; requestRender();
                     return;
                 }
                 const data = { entries: {}, extensions: {} };
                 const safeNewCover = sanitizeCoverDataUrl(state.newBookCover);
                 if (safeNewCover) data.extensions.pocket_codex_cover = safeNewCover;
-                const saved = await enqueueBookWrite(sanitized, () => saveBookData(sanitized, data, { refreshList: true }));
-                await applyBindingScope(sanitized, state.newBookBindScope);
+                const saved = await enqueueBookWrite(sanitized, async () => {
+                    const recheck = await fetchBooksList({ strict: true });
+                    if (recheck.some(b => String(b.file_id).toLowerCase() === sanitized.toLowerCase())) {
+                        throw new Error(tUi(
+                            uiLang,
+                            `Конфликт имени: Лорбук «${sanitized}» был только что создан в другом окне — пустая перезапись отменена.`,
+                            `Name conflict: Lorebook "${sanitized}" was concurrently created in another client — blank overwrite aborted.`,
+                        ));
+                    }
+                    return saveBookData(sanitized, data, { refreshList: true });
+                });
+                let postNotice = '';
+                if (isSameContextAnchor(originAnchor)) {
+                    await applyBindingScope(sanitized, originScope, originAnchor);
+                } else if (originScope === 'global') {
+                    await applyBindingScope(sanitized, 'global');
+                } else if (originScope !== 'none') {
+                    postNotice = tUi(
+                        uiLang,
+                        `Лорбук «${sanitized}» создан, но чат сменился во время записи — привязка к новому чату пропущена.`,
+                        `Lorebook "${sanitized}" was created, but the active chat changed during save — binding to the new chat was skipped.`,
+                    );
+                    try { window.toastr?.warning?.(postNotice); } catch {}
+                }
                 await fetchBooksList();
-                state.activeBookId = sanitized; state.activeBookData = saved; state.screen = 'book_entries'; requestRender();
+                state.activeBookId = sanitized; state.activeBookData = saved; state.saveError = postNotice; state.screen = 'book_entries'; requestRender();
             } catch (err) {
                 window.alert(tUi(uiLang, 'Не удалось проверить или создать Лорбук: ', 'Failed to verify or create Lorebook: ') + (err?.message || String(err)));
             }
@@ -2261,7 +2435,7 @@ export function createForgeController(deps) {
         }
 
         // Wizard & Approve events
-        win.querySelector('#pcx-fg-back-wiz')?.addEventListener('click', () => { state.screen = 'wizard'; requestRender(); });
+        win.querySelector('#pcx-fg-back-wiz')?.addEventListener('click', () => { state.wizOriginSession = null; state.screen = 'wizard'; requestRender(); });
         win.querySelector('#pcx-fg-target-mode')?.addEventListener('change', e => {
             state.targetBookMode = e.target.value;
             if (state.targetBookMode === 'existing' && !state.targetExistingId && state.books[0]) state.targetExistingId = state.books[0].file_id;
