@@ -2,7 +2,7 @@
 
 ![Pocket Codex & Forge Banner](assets/hero-banner.jpg)
 
-# Pocket Codex & Forge `[BETA v0.9.9]`
+# Pocket Codex & Forge `[BETA v1.0.0]`
 
 **A dual-wing Author's Notebook & Lorebook Forge for SillyTavern — crafted for both Desktop and Mobile screens.**
 

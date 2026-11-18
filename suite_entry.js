@@ -1,5 +1,5 @@
 import { THEMES, LANGUAGES, HELP_TIPS, HELP_TIPS_EN, ICONS, THEME_CRESTS, THEME_BANNERS, SUITE_CSS } from './modules/themes_and_icons.js';
-import { CODEX_PROMPT_PRESETS, FORGE_BOOK_PRESETS, formatCleanParagraphs, UI_DICT, tUi, displayCategoryName } from './modules/presets_and_i18n.js';
+import { CODEX_PROMPT_PRESETS, FORGE_BOOK_PRESETS, formatCleanParagraphs, isSchemaUnsupportedError, unwrapAndParseModelJson, UI_DICT, tUi, displayCategoryName } from './modules/presets_and_i18n.js';
 import { createForgeController } from './modules/forge_module.js';
 
 const MODULE_NAME = 'st_pocket_codex';
@@ -71,13 +71,16 @@ const NOTE_OUTPUT_JSON_SCHEMA = {
 
 let stApi = null, scriptModRef = null, sharedModRef = null, powerUserModRef = null, worldInfoModRef = null, forgeCtrl = null;
 let isExpandingMacro = false;
+let codexAiSeq = 0;
 const activeRegisteredPromptKeys = new Set();
+const lastActivatedWiKeys = new Set();
 
 let uiState = {
     wing: 'codex', view: 'notes', sectionMode: 'create', secDraft: null, editTab: 'manual',
     showGmPromptEditor: false, openTipId: null, editingNoteId: null, draftAttachments: null,
     showThemes: false, aiGenerating: false, aiPromptDraft: '', aiRefinementText: '',
     aiCandidates: [], aiCandidateIdx: 0, aiStatus: '',
+    noteQuery: '', noteFilter: 'all', lastDeletedNote: null,
 };
 
 function escapeHtml(str) {
@@ -95,18 +98,23 @@ function renderHelpBubble(tipId) {
     return `<div class="pcx-q-bubble">${escapeHtml(text)}</div>`;
 }
 
+async function importCoreModule(candidates) {
+    let lastError = null;
+    for (const specifier of candidates) {
+        try { return await import(specifier); }
+        catch (error) { lastError = error; }
+    }
+    console.warn('[PocketCodex] Core module import failed:', candidates.join(', '), lastError);
+    return {};
+}
+
 async function initStApi() {
     const ctx = window.SillyTavern?.getContext?.() || {};
-    let scriptMod = {}, extMod = {};
-    try { scriptMod = await import('../../../script.js'); } catch {}
-    try { extMod = await import('../../extensions.js'); } catch {}
-    try { sharedModRef = await import('../../shared.js'); } catch {}
-    try { powerUserModRef = await import('../../power-user.js'); } catch {
-        try { powerUserModRef = await import('../../../power-user.js'); } catch {}
-    }
-    try { worldInfoModRef = await import('../../world-info.js'); } catch {
-        try { worldInfoModRef = await import('../../../world-info.js'); } catch {}
-    }
+    const scriptMod = await importCoreModule(['../../../../script.js', '../../../script.js']);
+    const extMod = await importCoreModule(['../../../extensions.js', '../../extensions.js']);
+    sharedModRef = await importCoreModule(['../../shared.js', '../../../extensions/shared.js']);
+    powerUserModRef = await importCoreModule(['../../../power-user.js', '../../power-user.js']);
+    worldInfoModRef = await importCoreModule(['../../../world-info.js', '../../world-info.js']);
     scriptModRef = scriptMod;
 
     const coreTypes = scriptMod.extension_prompt_types || ctx.extension_prompt_types;
@@ -133,7 +141,17 @@ async function initStApi() {
             return Boolean((c.characterId !== undefined && c.characterId !== null && c.characterId !== '') || c.groupId);
         },
         saveSettings() { const fn = this.ctx.saveSettingsDebounced || scriptMod.saveSettingsDebounced; if (typeof fn === 'function') fn(); },
-        saveMetadata() { if (!this.isChatOpen()) return; const fn = this.ctx.saveMetadataDebounced || extMod.saveMetadataDebounced || scriptMod.saveChatDebounced; if (typeof fn === 'function') fn(); },
+        saveMetadata() {
+            if (!this.isChatOpen()) return;
+            // saveMetadata writes only chat metadata. saveChatDebounced can overwrite a
+            // newer message snapshot produced by another extension or the core UI.
+            const fn = this.ctx.saveMetadata || this.ctx.saveMetadataDebounced || extMod.saveMetadata;
+            if (typeof fn === 'function') fn();
+        },
+        cancelPendingChatSaves() {
+            scriptMod.cancelDebouncedChatSave?.();
+            extMod.cancelDebouncedMetadataSave?.();
+        },
         setPrompt(key, value, pos, depth, scan, role) { const fn = this.ctx.setExtensionPrompt || scriptMod.setExtensionPrompt; if (typeof fn === 'function') fn(key, value, pos, depth, scan, role); },
         registerMacro(name, fn) { if (typeof this.ctx.registerMacro === 'function') { try { this.ctx.registerMacro(name, fn); } catch {} } },
         get worldInfoMod() { return worldInfoModRef; },
@@ -153,7 +171,8 @@ async function initStApi() {
             const slashFn = this.ctx.executeSlashCommandsWithOptions || scriptMod.executeSlashCommandsWithOptions;
             if (typeof slashFn === 'function') {
                 try {
-                    const cmd = isActive ? `/world state=off silent=true ${bookId}` : `/world silent=true ${bookId}`;
+                    const quotedName = JSON.stringify(String(bookId));
+                    const cmd = isActive ? `/world state=off silent=true ${quotedName}` : `/world silent=true ${quotedName}`;
                     await slashFn(cmd, { handleParserErrors: false, handleExecutionErrors: false });
                     return !isActive;
                 } catch {}
@@ -220,35 +239,60 @@ async function initStApi() {
         },
         async toggleCharLorebook(bookId) {
             const c = this.ctx;
-            if (c.characterId === undefined || c.characterId === null || c.characterId === '') return false;
+            if (c.groupId || c.characterId === undefined || c.characterId === null || c.characterId === '') return false;
             const ch = Array.isArray(c.characters) ? c.characters[c.characterId] : null;
             if (!ch) return false;
             const cur = ch?.data?.extensions?.world || '';
             const nextVal = (cur === bookId) ? '' : bookId;
-            if (!ch.data) ch.data = {};
-            if (!ch.data.extensions) ch.data.extensions = {};
-            if (nextVal) ch.data.extensions.world = nextVal;
-            else delete ch.data.extensions.world;
-            if (typeof c.writeExtensionField === 'function') {
-                try { await c.writeExtensionField(c.characterId, 'world', nextVal); } catch {}
-            } else if (typeof scriptMod.saveCharacterDebounced === 'function') {
-                scriptMod.saveCharacterDebounced();
+            const updatePrimary = worldInfoModRef?.charUpdatePrimaryWorld;
+            if (typeof updatePrimary === 'function' && !c.groupId) {
+                await updatePrimary(nextVal);
+            } else if (typeof c.writeExtensionField === 'function') {
+                // Empty string preserves the key and can be resurrected by a card save.
+                // The core sentinel deletes data.extensions.world from both memory and PNG.
+                const UNSET_EXTENSION_FIELD = '__@@UNSET@@__';
+                await c.writeExtensionField(c.characterId, 'world', nextVal || UNSET_EXTENSION_FIELD);
+            } else {
+                if (!ch.data) ch.data = {};
+                if (!ch.data.extensions) ch.data.extensions = {};
+                if (nextVal) ch.data.extensions.world = nextVal;
+                else delete ch.data.extensions.world;
+                scriptMod.saveCharacterDebounced?.();
             }
-            if (window.jQuery) {
-                window.jQuery('#character_world').val(nextVal);
-            }
+            if (window.jQuery) window.jQuery('#character_world').val(nextVal);
             await this.refreshWorldInfoUI();
             return Boolean(nextVal);
         },
-        async saveWorldInfoNative(name, data) {
-            if (typeof worldInfoModRef?.saveWorldInfo === 'function') await worldInfoModRef.saveWorldInfo(name, data, true);
-            else throw new Error('Fallback REST');
+        wasWiEntryActivated(bookName, uid) {
+            if (!bookName || uid === undefined || uid === null) return false;
+            return lastActivatedWiKeys.has(`${bookName}::${uid}`);
+        },
+        async syncWorldInfoAfterSave(name, data) {
+            try {
+                const cloned = JSON.parse(JSON.stringify(data));
+                worldInfoModRef?.worldInfoCache?.set?.(name, cloned);
+                try { worldInfoModRef?.reloadEditor?.(name, false); } catch {}
+                const evSrc = this.eventSource, evT = this.eventTypes;
+                if (evSrc?.emit && evT?.WORLDINFO_UPDATED) {
+                    await evSrc.emit(evT.WORLDINFO_UPDATED, name, cloned);
+                }
+            } catch (err) {
+                console.warn('[PocketCodex] Cache sync warning:', err);
+            }
         },
         async deleteWorldInfoBook(name) {
             const res = await fetch('/api/worldinfo/delete', {
                 method: 'POST', headers: this.getRequestHeaders(), body: JSON.stringify({ name }),
             });
-            if (!res.ok) throw new Error('Не удалось удалить файл Лорбука.');
+            if (!res.ok) throw new Error(`Не удалось удалить файл Лорбука (HTTP ${res.status}).`);
+            try { worldInfoModRef?.worldInfoCache?.delete?.(name); } catch {}
+            try {
+                const pu = this.ctx.powerUserSettings || powerUserModRef?.power_user;
+                if (pu && pu.persona_description_lorebook === name) {
+                    pu.persona_description_lorebook = '';
+                    this.saveSettings();
+                }
+            } catch {}
             await this.refreshWorldInfoUI();
         },
         async refreshWorldInfoUI() {
@@ -257,8 +301,12 @@ async function initStApi() {
         async generateWithSchemaFallback(systemPrompt, userPrompt, schemaObj) {
             const fn = this.ctx.generateRaw || scriptMod.generateRaw;
             if (typeof fn === 'function') {
+                if (!schemaObj) return await fn({ prompt: userPrompt, systemPrompt });
                 try { return await fn({ prompt: userPrompt, systemPrompt, jsonSchema: schemaObj }); }
-                catch { return await fn({ prompt: userPrompt, systemPrompt }); }
+                catch (err) {
+                    if (!isSchemaUnsupportedError(err)) throw err;
+                    return await fn({ prompt: userPrompt, systemPrompt });
+                }
             }
             const qFn = this.ctx.generateQuietPrompt || scriptMod.generateQuietPrompt;
             if (typeof qFn === 'function') return await qFn({ quietPrompt: `${systemPrompt}\n\n${userPrompt}`, quietToLoud: false, skipWIAN: true });
@@ -306,7 +354,10 @@ function normalizeStore(store) {
             c.subHeaderStyle = 'h4_blank';
         }
     }
+    const catIdSet = new Set(store.categories.map(c => c.id));
+    const fallbackCatId = store.categories[0]?.id || 'classic_an';
     for (const n of store.notes) {
+        if (!n.categoryId || !catIdSet.has(n.categoryId)) n.categoryId = fallbackCatId;
         if (n.includeTitle === undefined) n.includeTitle = false;
         if (!n.subHeaderStyle) n.subHeaderStyle = 'inherit';
         if (n.collapsed === undefined) n.collapsed = false;
@@ -386,7 +437,11 @@ function compressImageFile(file, maxSide = 780, quality = 0.78) {
                 const canvas = document.createElement('canvas');
                 canvas.width = w; canvas.height = h;
                 canvas.getContext('2d').drawImage(img, 0, 0, w, h);
-                resolve({ id: 'att_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6), kind: 'image', name: file.name, dataUrl: canvas.toDataURL('image/webp', quality) });
+                let encoded = canvas.toDataURL('image/webp', quality);
+                if (encoded.startsWith('data:image/png')) {
+                    encoded = canvas.toDataURL('image/jpeg', quality);
+                }
+                resolve({ id: 'att_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6), kind: 'image', name: file.name, dataUrl: encoded });
             };
             img.src = reader.result;
         };
@@ -432,8 +487,13 @@ function getCharacterDescriptionText() {
         if (ctx.groupId && Array.isArray(ctx.groups)) {
             const grp = ctx.groups.find(g => String(g.id) === String(ctx.groupId));
             if (grp && Array.isArray(grp.members)) {
-                const blocks = grp.members.map(av => chars.find(c => c.avatar === av)).map(ch => formatSingleCharCard(ch)).filter(Boolean);
-                if (blocks.length) return blocks.join('\n\n');
+                const memberCards = grp.members
+                    .slice(0, 5)
+                    .map(av => chars.find(c => c.avatar === av))
+                    .filter(Boolean)
+                    .map(ch => formatSingleCharCard(ch, ch.name))
+                    .filter(Boolean);
+                if (memberCards.length > 0) return memberCards.join('\n\n');
             }
         }
         if (ctx.characterId !== undefined && ctx.characterId !== null && chars[ctx.characterId]) {
@@ -474,10 +534,14 @@ function buildChatContextSnippet(radius) {
 }
 
 function extractNoteFromModelOutput(raw) {
-    if (raw && typeof raw === 'object' && typeof raw.content === 'string' && typeof raw.title === 'string') {
-        return { title: raw.title.trim(), content: formatCleanParagraphs(raw.content) };
+    const unwrapped = unwrapAndParseModelJson(raw, 'note');
+    if (unwrapped && typeof unwrapped === 'object' && !Array.isArray(unwrapped)) {
+        const cStr = typeof unwrapped.content === 'string' ? unwrapped.content : (unwrapped.note || unwrapped.text || '');
+        if (cStr) {
+            return { title: String(unwrapped.title || '').trim(), content: formatCleanParagraphs(cStr) };
+        }
     }
-    let txt = typeof raw === 'string' ? raw : (raw?.content || raw?.choices?.[0]?.message?.content || raw?.text || '');
+    let txt = typeof raw === 'string' ? raw : (typeof raw?.content === 'string' ? raw.content : (raw?.choices?.[0]?.message?.content || raw?.text || ''));
     txt = String(txt || '').replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
     const unfenced = txt.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
     try {
@@ -525,22 +589,40 @@ async function runAiNoteGeneration({ taskText, currentDraftText, attachments, pr
     }
 
     const userPrompt = parts.join('\n\n');
-    const profileId = s.aiProfileId || '';
+    const uiLang = s.uiLang || 'ru';
+    const profileId = (s.aiProfileId || '').trim();
     const service = stApi.connectionService;
     const maxTokens = Math.max(800, Number(s.aiMaxTokens) || 3400);
 
-    if (profileId && service && typeof service.sendRequest === 'function') {
+    if (profileId) {
+        if (!service || typeof service.sendRequest !== 'function') {
+            throw new Error(tUi(
+                uiLang,
+                'Сервис профилей подключения SillyTavern недоступен. Выберите «[ Текущее подключение ]» или включите Connection Manager.',
+                'SillyTavern Connection Manager is unavailable. Select "[ Current Connection ]" or enable Connection Manager.',
+            ));
+        }
         const chosen = getConnectionProfiles().find(p => p.id === profileId);
-        if (chosen) {
-            const isTc = chosen.mode === 'tc';
-            const payload = isTc ? `${systemPrompt}\n\n${userPrompt}` : [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }];
-            try {
-                const res = await service.sendRequest(profileId, payload, maxTokens, { stream: false, extractData: true, includePreset: false, includeInstruct: false }, isTc ? {} : { response_format: { type: 'json_schema', json_schema: { name: NOTE_OUTPUT_JSON_SCHEMA.name, strict: true, schema: NOTE_OUTPUT_JSON_SCHEMA.value } } });
-                return extractNoteFromModelOutput(res);
-            } catch {
-                const res2 = await service.sendRequest(profileId, payload, maxTokens, { stream: false, extractData: true, includePreset: false, includeInstruct: false });
-                return extractNoteFromModelOutput(res2);
-            }
+        if (!chosen) {
+            throw new Error(tUi(
+                uiLang,
+                'Выбранный профиль подключения ИИ больше не существует. Выберите другой профиль.',
+                'The selected AI Connection Profile no longer exists. Please choose another profile.',
+            ));
+        }
+        const isTc = chosen.mode === 'tc';
+        const payload = isTc ? `${systemPrompt}\n\n${userPrompt}` : [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }];
+        if (isTc) {
+            const resTc = await service.sendRequest(profileId, payload, maxTokens, { stream: false, extractData: true, includePreset: false, includeInstruct: false });
+            return extractNoteFromModelOutput(resTc);
+        }
+        try {
+            const res = await service.sendRequest(profileId, payload, maxTokens, { stream: false, extractData: true, includePreset: false, includeInstruct: false }, { json_schema: NOTE_OUTPUT_JSON_SCHEMA });
+            return extractNoteFromModelOutput(res);
+        } catch (err) {
+            if (!isSchemaUnsupportedError(err)) throw err;
+            const res2 = await service.sendRequest(profileId, payload, maxTokens, { stream: false, extractData: true, includePreset: false, includeInstruct: false });
+            return extractNoteFromModelOutput(res2);
         }
     }
     return extractNoteFromModelOutput(await stApi.generateWithSchemaFallback(systemPrompt, userPrompt, NOTE_OUTPUT_JSON_SCHEMA));
@@ -655,11 +737,12 @@ function buildMacroNotebookText() {
 
 function buildAutoInjectGroups(ignoreInterval = false) {
     const all = gatherOrderedSectionsWithNotes();
-    const chatLen = Array.isArray(stApi.ctx?.chat) ? stApi.ctx.chat.length : 0;
+    const chatMsgs = Array.isArray(stApi.ctx?.chat) ? stApi.ctx.chat : [];
+    const userTurnCount = chatMsgs.filter(m => m && !m.is_system && m.is_user).length;
     const groupsMap = new Map();
     for (const sec of all) {
         if (sec.pos === ST_POS.MACRO_ONLY || sec.pos === ST_POS.LOCAL_ONLY) continue;
-        if (!ignoreInterval && sec.interval > 1 && (chatLen % sec.interval !== 0)) continue;
+        if (!ignoreInterval && sec.interval > 1 && (userTurnCount % sec.interval !== 0)) continue;
         const effectiveDepth = sec.pos === ST_POS.IN_CHAT ? sec.depth : 0;
         const sig = `p${sec.pos}_d${effectiveDepth}_r${sec.role}`;
         if (!groupsMap.has(sig)) groupsMap.set(sig, { sig, pos: sec.pos, depth: effectiveDepth, role: sec.role, sectionNames: [], blocks: [] });
@@ -698,6 +781,8 @@ function updateExtensionPrompt() {
 function saveAll() {
     updateExtensionPrompt(); stApi.saveSettings(); stApi.saveMetadata();
 }
+
+let renderGeneration = 0;
 
 function applyThemeClasses() {
     const s = ensureSettings();
@@ -760,17 +845,19 @@ function enableSmoothCardDrag(win, store, currentCatId) {
             card.classList.remove('pcx-card-floating');
             card.style.width = ''; card.style.left = ''; card.style.top = ''; card.style.transform = '';
             placeholder.parentNode?.insertBefore(card, placeholder); placeholder.remove();
+            if (!bodyEl.isConnected) return;
             const orderedIds = [...bodyEl.querySelectorAll('.pcx-card')].map(el => el.dataset.noteId).filter(Boolean);
+            if (!orderedIds.length) return;
+            const orderedSet = new Set(orderedIds);
             const catMap = new Map();
             for (const n of store.notes) if (n.categoryId === currentCatId) catMap.set(n.id, n);
-            const reordered = orderedIds.map(id => catMap.get(id)).filter(Boolean);
-            const res = []; let ins = false;
-            for (const n of store.notes) {
-                if (n.categoryId === currentCatId) { if (!ins) { res.push(...reordered); ins = true; } }
-                else res.push(n);
-            }
-            if (!ins) res.push(...reordered);
-            store.notes = res; saveAll();
+            const reorderedQueue = orderedIds.map(id => catMap.get(id)).filter(Boolean);
+            let qIdx = 0;
+            store.notes = store.notes.map(n => {
+                if (n.categoryId !== currentCatId || !orderedSet.has(n.id)) return n;
+                return reorderedQueue[qIdx++] || n;
+            });
+            saveAll();
         };
         if (isTouch) {
             window.addEventListener('touchmove', onMove, { passive: false });
@@ -868,6 +955,8 @@ function enableTabReorder(win, store, settings) {
 }
 
 function renderModal(opts = {}) {
+    const generation = ++renderGeneration;
+    const chatIdAtStart = stApi.ctx?.getCurrentChatId?.() || stApi.ctx?.chatId || '';
     const s = ensureSettings();
     const uiLang = s.uiLang || 'ru';
     const dUi = UI_DICT[uiLang] || UI_DICT.ru;
@@ -885,6 +974,10 @@ function renderModal(opts = {}) {
     const savedTabsScroll = prevTabsBar ? prevTabsBar.scrollLeft : 0;
     const prevBody = win.querySelector('.pcx-body');
     const savedBodyScroll = opts.preserveBodyScroll && prevBody ? prevBody.scrollTop : 0;
+    const activeEl = document.activeElement;
+    const savedSearchFocus = (activeEl && win.contains(activeEl) && activeEl.classList?.contains('pcx-search-input') && activeEl.id)
+        ? { id: activeEl.id, start: activeEl.selectionStart, end: activeEl.selectionEnd }
+        : null;
 
     applyThemeClasses();
 
@@ -1010,59 +1103,59 @@ function renderModal(opts = {}) {
 
             bodyHtml = `
                 <div class="pcx-panel-box">
-                    <div style="font-size:14.5px;font-weight:800;">${isEdit ? `Раздел «${escapeHtml(currentCat?.name || '')}»` : 'Новый раздел'}</div>
-                    <div><label class="pcx-field-label">Название раздела</label><input id="pcx-sec-name-input" class="pcx-input" value="${escapeHtml(d.name)}" placeholder="Например: Отношения и Биография"></div>
+                    <div style="font-size:14.5px;font-weight:800;">${isEdit ? `${tUi(uiLang, 'Раздел', 'Section')} «${escapeHtml(displayCategoryName(currentCat, uiLang))}»` : tUi(uiLang, 'Новый раздел', 'New Section')}</div>
+                    <div><label class="pcx-field-label">${tUi(uiLang, 'Название раздела', 'Section Name')}</label><input id="pcx-sec-name-input" class="pcx-input" value="${escapeHtml(d.name)}" placeholder="${tUi(uiLang, 'Например: Отношения и Биография', 'e.g. Relationships & Bio')}"></div>
 
                     <div>
-                        <label class="pcx-field-label">Режим заголовков раздела и записей ${renderHelpBtn('sec_header')}</label>
+                        <label class="pcx-field-label">${tUi(uiLang, 'Режим заголовков раздела и записей', 'Section & Note Header Mode')} ${renderHelpBtn('sec_header')}</label>
                         ${renderHelpBubble('sec_header')}
                         <select id="pcx-sec-hmode-select" class="pcx-select">
-                            <option value="sec_and_auto_notes" ${hMode === 'sec_and_auto_notes' ? 'selected' : ''}>Заголовок раздела + подзаголовки всех записей</option>
-                            <option value="sec_and_custom_notes" ${hMode === 'sec_and_custom_notes' ? 'selected' : ''}>Заголовок раздела + отмеченные подзаголовки</option>
-                            <option value="only_notes" ${hMode === 'only_notes' ? 'selected' : ''}>Без заголовка раздела (только отмеченные подзаголовки)</option>
-                            <option value="none" ${hMode === 'none' ? 'selected' : ''}>Без любых заголовков (только чистый текст)</option>
+                            <option value="sec_and_auto_notes" ${hMode === 'sec_and_auto_notes' ? 'selected' : ''}>${tUi(uiLang, 'Заголовок раздела + подзаголовки всех записей', 'Section header + all note subheaders')}</option>
+                            <option value="sec_and_custom_notes" ${hMode === 'sec_and_custom_notes' ? 'selected' : ''}>${tUi(uiLang, 'Заголовок раздела + отмеченные подзаголовки', 'Section header + selected note subheaders')}</option>
+                            <option value="only_notes" ${hMode === 'only_notes' ? 'selected' : ''}>${tUi(uiLang, 'Без заголовка раздела (только отмеченные подзаголовки)', 'No section header (selected note subheaders only)')}</option>
+                            <option value="none" ${hMode === 'none' ? 'selected' : ''}>${tUi(uiLang, 'Без любых заголовков (только чистый текст)', 'No headings at all (plain text only)')}</option>
                         </select>
                     </div>
 
                     ${hMode !== 'none' ? `
                         <div>
-                            <label class="pcx-field-label">Вид подзаголовка записи и отступа</label>
+                            <label class="pcx-field-label">${tUi(uiLang, 'Вид подзаголовка записи и отступа', 'Note Subheader Style & Spacing')}</label>
                             <select id="pcx-sec-substyle-select" class="pcx-select">
-                                <option value="h4_blank" ${subStyle === 'h4_blank' ? 'selected' : ''}>#### Подзаголовок + пустая строка-отступ</option>
-                                <option value="bracket_blank" ${subStyle === 'bracket_blank' ? 'selected' : ''}>[Подзаголовок] + пустая строка-отступ</option>
-                                <option value="colon_blank" ${subStyle === 'colon_blank' ? 'selected' : ''}>Подзаголовок: + пустая строка-отступ</option>
-                                <option value="h4_line" ${subStyle === 'h4_line' ? 'selected' : ''}>#### Подзаголовок + перенос строки</option>
+                                <option value="h4_blank" ${subStyle === 'h4_blank' ? 'selected' : ''}>${tUi(uiLang, '#### Подзаголовок + пустая строка-отступ', '#### Subheader + blank line')}</option>
+                                <option value="bracket_blank" ${subStyle === 'bracket_blank' ? 'selected' : ''}>${tUi(uiLang, '[Подзаголовок] + пустая строка-отступ', '[Subheader] + blank line')}</option>
+                                <option value="colon_blank" ${subStyle === 'colon_blank' ? 'selected' : ''}>${tUi(uiLang, 'Подзаголовок: + пустая строка-отступ', 'Subheader: + blank line')}</option>
+                                <option value="h4_line" ${subStyle === 'h4_line' ? 'selected' : ''}>${tUi(uiLang, '#### Подзаголовок + перенос строки', '#### Subheader + line break')}</option>
                             </select>
                         </div>` : ''}
 
                     <div>
-                        <span class="pcx-field-label">Наглядный пример склейки с отступами</span>
+                        <span class="pcx-field-label">${tUi(uiLang, 'Наглядный пример склейки с отступами', 'Live Formatting Preview')}</span>
                         <div class="pcx-preview-box notranslate" translate="no" id="pcx-sec-live-preview" style="max-height:130px">${escapeHtml(liveHeaderSample)}</div>
                     </div>
 
                     <div>
-                        <label class="pcx-field-label">Куда отправлять раздел? ${renderHelpBtn('sec_pos')}</label>
+                        <label class="pcx-field-label">${tUi(uiLang, 'Куда отправлять раздел?', 'Prompt Routing Target')} ${renderHelpBtn('sec_pos')}</label>
                         ${renderHelpBubble('sec_pos')}
                         <select id="pcx-sec-pos-select" class="pcx-select">
-                            <option value="1" ${pos === ST_POS.IN_CHAT ? 'selected' : ''}>В глубине чата (@ Depth)</option>
-                            <option value="2" ${pos === ST_POS.BEFORE_MAIN ? 'selected' : ''}>Перед главным промптом</option>
-                            <option value="0" ${pos === ST_POS.AFTER_MAIN ? 'selected' : ''}>После главного промпта</option>
-                            <option value="-1" ${pos === ST_POS.MACRO_ONLY ? 'selected' : ''}>В макрос {{notebook}}</option>
-                            <option value="-2" ${pos === ST_POS.LOCAL_ONLY ? 'selected' : ''}>Никуда (личная памятка для себя)</option>
+                            <option value="1" ${pos === ST_POS.IN_CHAT ? 'selected' : ''}>${tUi(uiLang, 'В глубине чата (@ Depth)', 'In-Chat (@ Depth)')}</option>
+                            <option value="2" ${pos === ST_POS.BEFORE_MAIN ? 'selected' : ''}>${tUi(uiLang, 'Перед главным промптом', 'Before Main Prompt')}</option>
+                            <option value="0" ${pos === ST_POS.AFTER_MAIN ? 'selected' : ''}>${tUi(uiLang, 'После главного промпта', 'After Main Prompt')}</option>
+                            <option value="-1" ${pos === ST_POS.MACRO_ONLY ? 'selected' : ''}>${tUi(uiLang, 'В макрос {{notebook}}', 'Into {{notebook}} Macro')}</option>
+                            <option value="-2" ${pos === ST_POS.LOCAL_ONLY ? 'selected' : ''}>${tUi(uiLang, 'Никуда (личная памятка для себя)', 'Nowhere (Local Reference Only)')}</option>
                         </select>
                     </div>
                     ${(pos !== ST_POS.MACRO_ONLY && pos !== ST_POS.LOCAL_ONLY) ? `
                         <div class="${pos === ST_POS.IN_CHAT ? 'pcx-row-2' : ''}">
-                            ${pos === ST_POS.IN_CHAT ? `<div><label class="pcx-field-label">Глубина (0 = низ) ${renderHelpBtn('sec_depth')}</label><input id="pcx-sec-depth-input" type="number" min="0" max="999" class="pcx-input" value="${Math.max(0, Number(d.injectDepth) || 0)}"></div>` : ''}
-                            <div><label class="pcx-field-label">Роль ${renderHelpBtn('sec_role')}</label><select id="pcx-sec-role-select" class="pcx-select"><option value="0" ${Number(d.injectRole) === 0 ? 'selected' : ''}>Система (System)</option><option value="1" ${Number(d.injectRole) === 1 ? 'selected' : ''}>Пользователь (User)</option><option value="2" ${Number(d.injectRole) === 2 ? 'selected' : ''}>Ассистент (Assistant)</option></select></div>
+                            ${pos === ST_POS.IN_CHAT ? `<div><label class="pcx-field-label">${tUi(uiLang, 'Глубина (0 = низ)', 'Depth (0 = bottom)')} ${renderHelpBtn('sec_depth')}</label><input id="pcx-sec-depth-input" type="number" min="0" max="999" class="pcx-input" value="${Math.max(0, Number(d.injectDepth) || 0)}"></div>` : ''}
+                            <div><label class="pcx-field-label">${tUi(uiLang, 'Роль', 'Role')} ${renderHelpBtn('sec_role')}</label><select id="pcx-sec-role-select" class="pcx-select"><option value="0" ${Number(d.injectRole) === 0 ? 'selected' : ''}>System</option><option value="1" ${Number(d.injectRole) === 1 ? 'selected' : ''}>User</option><option value="2" ${Number(d.injectRole) === 2 ? 'selected' : ''}>Assistant</option></select></div>
                         </div>
                         ${renderHelpBubble('sec_depth')}${renderHelpBubble('sec_role')}
-                        <details class="pcx-spoiler"><summary style="padding:8px 11px;font-size:11.5px;color:var(--pcx-text-muted);"><span>Дополнительно (частота)</span><span style="width:14px;height:14px;display:inline-flex">${ICONS.chevDown}</span></summary><div class="pcx-spoiler-body" style="padding:10px 11px;"><label class="pcx-field-label">Каждые N сообщений (1 = каждый ход)</label><input id="pcx-sec-intv-input" type="number" min="1" max="100" class="pcx-input" value="${Math.max(1, Number(d.injectInterval) || 1)}"></div></details>
+                        <details class="pcx-spoiler"><summary style="padding:8px 11px;font-size:11.5px;color:var(--pcx-text-muted);"><span>${tUi(uiLang, 'Дополнительно (частота ходов)', 'Advanced (Turn Frequency)')}</span><span style="width:14px;height:14px;display:inline-flex">${ICONS.chevDown}</span></summary><div class="pcx-spoiler-body" style="padding:10px 11px;"><label class="pcx-field-label">${tUi(uiLang, 'Каждые N ходов игрока (1 = каждый ход)', 'Every N user turns (1 = every turn)')}</label><input id="pcx-sec-intv-input" type="number" min="1" max="100" class="pcx-input" value="${Math.max(1, Number(d.injectInterval) || 1)}"></div></details>
                     ` : ''}
-                    ${isEdit ? `<div class="pcx-toggle-row" id="pcx-sec-enabled-toggle"><div class="pcx-toggle-row-text"><span class="pcx-toggle-row-title">Раздел включён</span></div><div class="pcx-switch ${d.enabled !== false ? 'pcx-on' : ''}"></div></div>` : ''}
+                    ${isEdit ? `<div class="pcx-toggle-row" id="pcx-sec-enabled-toggle"><div class="pcx-toggle-row-text"><span class="pcx-toggle-row-title">${tUi(uiLang, 'Раздел включён', 'Section Enabled')}</span></div><div class="pcx-switch ${d.enabled !== false ? 'pcx-on' : ''}"></div></div>` : ''}
                     <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding-top:4px;flex-wrap:wrap;">
-                        <div>${(isEdit && store.categories.length > 1) ? `<button type="button" id="pcx-sec-delete-btn" class="pcx-icon-btn" style="color:var(--pcx-accent-2)">${ICONS.trash}<span>Удалить</span></button>` : ''}</div>
-                        <div style="display:flex;gap:8px;"><button type="button" id="pcx-sec-cancel-btn" class="pcx-icon-btn">Отмена</button><button type="button" id="pcx-sec-save-btn" class="pcx-primary-btn">${ICONS.check}<span>${isEdit ? 'Сохранить' : 'Создать'}</span></button></div>
+                        <div>${(isEdit && store.categories.length > 1) ? `<button type="button" id="pcx-sec-delete-btn" class="pcx-icon-btn" style="color:var(--pcx-accent-2)">${ICONS.trash}<span>${tUi(uiLang, 'Удалить', 'Delete')}</span></button>` : ''}</div>
+                        <div style="display:flex;gap:8px;"><button type="button" id="pcx-sec-cancel-btn" class="pcx-icon-btn">${tUi(uiLang, 'Отмена', 'Cancel')}</button><button type="button" id="pcx-sec-save-btn" class="pcx-primary-btn">${ICONS.check}<span>${isEdit ? tUi(uiLang, 'Сохранить', 'Save') : tUi(uiLang, 'Создать', 'Create')}</span></button></div>
                     </div>
                 </div>`;
         } else if (uiState.view === 'edit') {
@@ -1196,11 +1289,40 @@ function renderModal(opts = {}) {
                     `}
                 </div>`;
         } else {
-            const catNotes = store.notes.filter(n => n.categoryId === currentCat?.id);
+            const allCatNotes = store.notes.filter(n => n.categoryId === currentCat?.id);
+            const qNote = (uiState.noteQuery || '').trim().toLowerCase();
+            const catNotes = allCatNotes.filter(n => {
+                if (uiState.noteFilter === 'on' && n.enabled === false) return false;
+                if (uiState.noteFilter === 'off' && n.enabled !== false) return false;
+                if (!qNote) return true;
+                return `${n.title || ''} \n ${n.content || ''}`.toLowerCase().includes(qNote);
+            });
             const catEnabled = currentCat?.enabled !== false;
             const allCollapsed = catNotes.length > 0 && catNotes.every(n => n.collapsed);
-            const subbarHtml = catNotes.length > 1 ? `<div class="pcx-subbar"><span>Записей: ${catNotes.length}</span><button type="button" class="pcx-mini-btn" id="pcx-collapse-all-btn">${allCollapsed ? ICONS.chevDown : ICONS.chevUp}<span>${allCollapsed ? escapeHtml(dUi.expandAll) : escapeHtml(dUi.collapseAll)}</span></button></div>` : '';
-            const cardsHtml = catNotes.length === 0
+            const undoHtml = uiState.lastDeletedNote ? `
+                <div class="pcx-undo-bar">
+                    <span>${tUi(uiLang, 'Заметка удалена:', 'Note deleted:')} <b>${escapeHtml(uiState.lastDeletedNote.note.title || tUi(uiLang, 'Без названия', 'Untitled'))}</b></span>
+                    <button type="button" class="pcx-mini-btn" id="pcx-note-undo-btn">${ICONS.undo}<span>${tUi(uiLang, 'Вернуть', 'Undo')}</span></button>
+                </div>` : '';
+            const searchHtml = allCatNotes.length > 1 ? `
+                <div class="pcx-search-bar">
+                    <div class="pcx-search-wrap">
+                        <span class="pcx-search-icon">${ICONS.search}</span>
+                        <input type="text" id="pcx-codex-search" class="pcx-search-input" placeholder="${tUi(uiLang, 'Поиск заметок по заголовку и тексту...', 'Search notes by title or text...')}" value="${escapeHtml(uiState.noteQuery || '')}">
+                        ${uiState.noteQuery ? `<button type="button" class="pcx-search-clear" id="pcx-codex-search-clear">${ICONS.close}</button>` : ''}
+                    </div>
+                    <div class="pcx-filter-strip">
+                        ${[
+                            ['all', tUi(uiLang, 'Все', 'All')],
+                            ['on', tUi(uiLang, 'Включённые', 'Active')],
+                            ['off', tUi(uiLang, 'Выключенные', 'Muted')],
+                        ].map(([fid, flabel]) => `<button type="button" class="pcx-filter-chip ${uiState.noteFilter === fid ? 'pcx-active' : ''}" data-nfilter="${fid}">${flabel}</button>`).join('')}
+                    </div>
+                </div>` : '';
+            const subbarHtml = allCatNotes.length > 1 ? `<div class="pcx-subbar"><span>${tUi(uiLang, 'Записей:', 'Notes:')} ${catNotes.length}${catNotes.length !== allCatNotes.length ? ' / ' + allCatNotes.length : ''}</span><button type="button" class="pcx-mini-btn" id="pcx-collapse-all-btn">${allCollapsed ? ICONS.chevDown : ICONS.chevUp}<span>${allCollapsed ? escapeHtml(dUi.expandAll) : escapeHtml(dUi.collapseAll)}</span></button></div>` : '';
+            const cardsHtml = (allCatNotes.length > 0 && catNotes.length === 0)
+                ? `<div class="pcx-empty">${tUi(uiLang, 'По запросу заметок не найдено.', 'No matching notes found.')}</div>`
+                : catNotes.length === 0
                 ? `<div class="pcx-empty">${tUi(uiLang, 'Раздел', 'Section')} <b>«${escapeHtml(displayCategoryName(currentCat, uiLang))}»</b> ${tUi(uiLang, 'пока пуст.<br>Нажми', 'is empty.<br>Tap')} <b>«${escapeHtml(dUi.newNote)}»</b>.</div>`
                 : catNotes.map((note, idx) => {
                     const isOn = note.enabled !== false && catEnabled, isCol = Boolean(note.collapsed);
@@ -1227,12 +1349,14 @@ function renderModal(opts = {}) {
                             ${!isCol ? `<div class="pcx-card-footer"><button type="button" class="pcx-mini-btn" data-action="copy" data-id="${escapeHtml(note.id)}">${ICONS.copy}</button><button type="button" class="pcx-mini-btn" data-action="edit" data-id="${escapeHtml(note.id)}">${ICONS.edit}<span>Изменить</span></button><button type="button" class="pcx-mini-btn" data-action="delete" data-id="${escapeHtml(note.id)}">${ICONS.trash}</button></div>` : ''}
                         </div>`;
                 }).join('');
-            bodyHtml = subbarHtml + cardsHtml;
+            bodyHtml = undoHtml + searchHtml + subbarHtml + cardsHtml;
         }
     }
 
     const bannerSvg = THEME_BANNERS[themeObj.id] || THEME_BANNERS.tavern;
 
+    if (generation !== renderGeneration) return;
+    if ((stApi.ctx?.getCurrentChatId?.() || stApi.ctx?.chatId || '') !== chatIdAtStart) return;
     win.innerHTML = `
         <div class="pcx-header">
             <div class="pcx-header-left">
@@ -1273,6 +1397,13 @@ function renderModal(opts = {}) {
     if (newTabsBar && !opts.scrollTabsToStart) newTabsBar.scrollLeft = savedTabsScroll;
     const newBody = win.querySelector('.pcx-body');
     if (newBody && opts.preserveBodyScroll) newBody.scrollTop = savedBodyScroll;
+    if (savedSearchFocus) {
+        const nextSearchEl = win.querySelector('#' + savedSearchFocus.id);
+        if (nextSearchEl) {
+            nextSearchEl.focus({ preventScroll: true });
+            try { nextSearchEl.setSelectionRange(savedSearchFocus.start, savedSearchFocus.end); } catch {}
+        }
+    }
 
     bindCommonAndCodexEvents();
     if (isForgeWing) forgeCtrl.bindForgeEvents(win);
@@ -1487,18 +1618,50 @@ function bindCommonAndCodexEvents() {
     win.querySelector('#pcx-ai-char-desc')?.addEventListener('change', e => { s.aiSendCharDesc = e.target.checked; saveAll(); });
     win.querySelector('#pcx-ai-user-desc')?.addEventListener('change', e => { s.aiSendUserDesc = e.target.checked; saveAll(); });
 
+    win.querySelector('#pcx-codex-search')?.addEventListener('input', e => {
+        uiState.noteQuery = e.target.value;
+        renderModal({ preserveTabsScroll: true, preserveBodyScroll: true });
+    });
+    win.querySelector('#pcx-codex-search-clear')?.addEventListener('click', () => {
+        uiState.noteQuery = '';
+        renderModal({ preserveTabsScroll: true, preserveBodyScroll: true });
+    });
+    win.querySelectorAll('[data-nfilter]').forEach(chip => chip.addEventListener('click', () => {
+        uiState.noteFilter = chip.dataset.nfilter || 'all';
+        renderModal({ preserveTabsScroll: true, preserveBodyScroll: true });
+    }));
+    win.querySelector('#pcx-note-undo-btn')?.addEventListener('click', () => {
+        const last = uiState.lastDeletedNote;
+        if (!last || !last.note) return;
+        const targetStore = last.scope === 'global' ? s.globalData : (getChatStore() || store);
+        if (!targetStore.notes.some(n => n.id === last.note.id)) {
+            targetStore.notes.unshift(last.note);
+            normalizeStore(targetStore);
+        }
+        uiState.lastDeletedNote = null;
+        saveAll();
+        renderModal({ preserveTabsScroll: true, preserveBodyScroll: true });
+    });
+
     win.querySelector('#pcx-run-ai-btn')?.addEventListener('click', async () => {
         if (uiState.aiGenerating) return;
         captureCurrentEditFields(win);
         const taskText = uiState.aiPromptDraft || '', currentContent = uiState.draftContent || '', atts = uiState.draftAttachments || [];
         if (!taskText.trim() && !currentContent.trim() && !atts.length) { uiState.aiStatus = 'Опиши задачу выше.'; renderModal({ preserveTabsScroll: true }); return; }
+        const reqSeq = ++codexAiSeq;
+        const chatAtStart = stApi.ctx?.getCurrentChatId?.() || stApi.ctx?.chatId || '';
+        const scopeAtStart = s.scope;
         uiState.aiGenerating = true; uiState.aiStatus = 'Соавтор создаёт вариант...'; renderModal({ preserveTabsScroll: true });
         try {
             const res = await runAiNoteGeneration({ taskText, currentDraftText: currentContent, attachments: atts });
+            if (reqSeq !== codexAiSeq || (stApi.ctx?.getCurrentChatId?.() || stApi.ctx?.chatId || '') !== chatAtStart || s.scope !== scopeAtStart) return;
             if (res.content) { uiState.aiCandidates.push({ title: res.title || '', content: res.content }); uiState.aiCandidateIdx = uiState.aiCandidates.length - 1; uiState.aiStatus = 'Проверь вариант ниже!'; }
             else uiState.aiStatus = 'Пустой ответ.';
-        } catch (err) { uiState.aiStatus = 'Ошибка: ' + (err?.message || String(err)); }
-        finally { uiState.aiGenerating = false; renderModal({ preserveTabsScroll: true }); }
+        } catch (err) {
+            if (reqSeq === codexAiSeq) uiState.aiStatus = 'Ошибка: ' + (err?.message || String(err));
+        } finally {
+            if (reqSeq === codexAiSeq) { uiState.aiGenerating = false; renderModal({ preserveTabsScroll: true }); }
+        }
     });
 
     win.querySelector('#pcx-run-refine-btn')?.addEventListener('click', async () => {
@@ -1506,12 +1669,19 @@ function bindCommonAndCodexEvents() {
         captureCurrentEditFields(win);
         const prev = uiState.aiCandidates[uiState.aiCandidateIdx], refText = (uiState.aiRefinementText || '').trim();
         if (!prev || !refText) return;
+        const reqSeq = ++codexAiSeq;
+        const chatAtStart = stApi.ctx?.getCurrentChatId?.() || stApi.ctx?.chatId || '';
+        const scopeAtStart = s.scope;
         uiState.aiGenerating = true; uiState.aiStatus = 'Вносим правки...'; renderModal({ preserveTabsScroll: true });
         try {
             const res = await runAiNoteGeneration({ taskText: uiState.aiPromptDraft || '', currentDraftText: uiState.draftContent || '', attachments: uiState.draftAttachments || [], previousCandidate: prev, refinementInstruction: refText });
+            if (reqSeq !== codexAiSeq || (stApi.ctx?.getCurrentChatId?.() || stApi.ctx?.chatId || '') !== chatAtStart || s.scope !== scopeAtStart) return;
             if (res.content) { uiState.aiCandidates.push({ title: res.title || prev.title || '', content: res.content }); uiState.aiCandidateIdx = uiState.aiCandidates.length - 1; uiState.aiRefinementText = ''; uiState.aiStatus = 'Обновлённый вариант готов!'; }
-        } catch (err) { uiState.aiStatus = 'Ошибка: ' + (err?.message || String(err)); }
-        finally { uiState.aiGenerating = false; renderModal({ preserveTabsScroll: true }); }
+        } catch (err) {
+            if (reqSeq === codexAiSeq) uiState.aiStatus = 'Ошибка: ' + (err?.message || String(err));
+        } finally {
+            if (reqSeq === codexAiSeq) { uiState.aiGenerating = false; renderModal({ preserveTabsScroll: true }); }
+        }
     });
 
     win.querySelector('#pcx-cand-prev')?.addEventListener('click', () => { captureCurrentEditFields(win); if (uiState.aiCandidateIdx > 0) uiState.aiCandidateIdx--; renderModal({ preserveTabsScroll: true, preserveBodyScroll: true }); });
@@ -1574,7 +1744,15 @@ function bindCommonAndCodexEvents() {
     }));
     win.querySelectorAll('[data-action="edit"]').forEach(el => el.addEventListener('click', () => { resetEditDrafts(); uiState.view = 'edit'; uiState.editTab = 'manual'; uiState.editingNoteId = el.dataset.id; renderModal({ preserveTabsScroll: true }); }));
     win.querySelectorAll('[data-action="delete"]').forEach(el => el.addEventListener('click', () => {
-        store.notes = store.notes.filter(n => n.id !== el.dataset.id); saveAll(); renderModal({ preserveTabsScroll: true, preserveBodyScroll: true });
+        const target = store.notes.find(n => n.id === el.dataset.id);
+        if (!target) return;
+        const uiLang = s.uiLang || 'ru';
+        const label = target.title || (target.content || '').slice(0, 32) || '#';
+        if (!window.confirm(tUi(uiLang, `Удалить заметку «${label}»?`, `Delete note "${label}"?`))) return;
+        uiState.lastDeletedNote = { scope: s.scope, note: JSON.parse(JSON.stringify(target)) };
+        store.notes = store.notes.filter(n => n.id !== el.dataset.id);
+        saveAll();
+        renderModal({ preserveTabsScroll: true, preserveBodyScroll: true });
     }));
 
     win.querySelector('#pcx-tips-master-toggle')?.addEventListener('click', () => {
@@ -1591,15 +1769,20 @@ function bindCommonAndCodexEvents() {
             'Reset extension theme, prompts, limits, and settings to factory defaults? (Your saved notes will be preserved.)',
         );
         if (!window.confirm(msg)) return;
-        const savedGlobalNotes = Array.isArray(s.globalData?.notes) ? JSON.parse(JSON.stringify(s.globalData.notes)) : [];
+        const savedGlobalData = s.globalData
+            ? JSON.parse(JSON.stringify(s.globalData))
+            : JSON.parse(JSON.stringify(DEFAULT_SETTINGS.globalData));
+        const globalCustomCats = (savedGlobalData.categories || []).filter(c => !DEFAULT_CATEGORIES.some(dc => dc.id === c.id));
+        const mergedGlobalCats = [
+            ...DEFAULT_CATEGORIES.map(dc => {
+                const prev = (savedGlobalData.categories || []).find(x => x.id === dc.id);
+                return prev ? { ...JSON.parse(JSON.stringify(dc)), enabled: prev.enabled, injectPos: prev.injectPos, injectDepth: prev.injectDepth, injectRole: prev.injectRole, injectInterval: prev.injectInterval } : JSON.parse(JSON.stringify(dc));
+            }),
+            ...globalCustomCats,
+        ];
         const fresh = JSON.parse(JSON.stringify(DEFAULT_SETTINGS));
-        fresh.globalData.notes = savedGlobalNotes;
+        fresh.globalData = normalizeStore({ categories: mergedGlobalCats, notes: savedGlobalData.notes || [] });
         stApi.extensionSettings[MODULE_NAME] = fresh;
-        const chatSt = getChatStore();
-        if (chatSt) {
-            const existingCustomCats = (chatSt.categories || []).filter(c => !DEFAULT_CATEGORIES.some(dc => dc.id === c.id));
-            chatSt.categories = [...JSON.parse(JSON.stringify(DEFAULT_CATEGORIES)), ...existingCustomCats];
-        }
         resetEditDrafts();
         applyThemeClasses();
         saveAll();
@@ -1637,8 +1820,12 @@ function mountExtensionButtons() {
         const leftSend = document.getElementById('leftSendForm');
         const btn = document.createElement('div');
         btn.id = 'pcx-sendbar-btn'; btn.className = 'interactable'; btn.tabIndex = 0;
+        btn.setAttribute('role', 'button');
         btn.title = 'Pocket Codex & Forge [BETA]'; btn.innerHTML = ICONS.book;
         btn.addEventListener('click', openModal);
+        btn.addEventListener('keydown', e => {
+            if (e.key === 'Enter' || e.key === ' ') openModal(e);
+        });
         if (wandBtn?.parentElement) wandBtn.insertAdjacentElement('afterend', btn);
         else if (leftSend) leftSend.appendChild(btn);
     }
@@ -1669,6 +1856,7 @@ function mountUI() {
         const dlg = document.createElement('dialog');
         dlg.id = 'pcx-dialog'; dlg.innerHTML = `<div id="pcx-window"></div>`;
         let downOnBackdrop = false;
+        dlg.addEventListener('cancel', e => { e.preventDefault(); closeModal(); });
         dlg.addEventListener('pointerdown', e => { downOnBackdrop = (e.target === dlg); });
         dlg.addEventListener('click', e => { if (downOnBackdrop && e.target === dlg) closeModal(); downOnBackdrop = false; });
         document.body.appendChild(dlg);
@@ -1691,9 +1879,10 @@ jQuery(async () => {
     const evSource = stApi.eventSource, evTypes = stApi.eventTypes;
     if (evSource && typeof evSource.on === 'function') {
         if (evTypes.WORLDINFO_ENTRIES_LOADED) {
-            evSource.on(evTypes.WORLDINFO_ENTRIES_LOADED, async (payload) => {
+            const loadExtraChatLore = async (payload) => {
                 try {
                     if (!payload || !Array.isArray(payload.chatLore) || !stApi.isChatOpen()) return;
+                    const chatIdAtStart = stApi.ctx?.getCurrentChatId?.() || stApi.ctx?.chatId || '';
                     const extras = Array.isArray(stApi.chatMetadata?.pcx_extra_world_info)
                         ? stApi.chatMetadata.pcx_extra_world_info.map(x => String(x || '').trim()).filter(Boolean)
                         : [];
@@ -1704,35 +1893,94 @@ jQuery(async () => {
                         ...(payload.chatLore || []).map(e => e?.world),
                         ...(payload.personaLore || []).map(e => e?.world),
                     ].filter(Boolean));
+                    const loadedEntries = [];
                     for (const bookName of extras) {
                         if (alreadyLoaded.has(bookName)) continue;
-                        let data = null;
-                        if (typeof worldInfoModRef?.loadWorldInfo === 'function') {
-                            data = await worldInfoModRef.loadWorldInfo(bookName);
-                        } else {
-                            const r = await fetch('/api/worldinfo/get', {
-                                method: 'POST', headers: stApi.getRequestHeaders(), body: JSON.stringify({ name: bookName }),
-                            });
-                            if (r.ok) data = await r.json();
-                        }
-                        if (data && data.entries && typeof data.entries === 'object') {
-                            for (const ent of Object.values(data.entries)) {
-                                if (ent) payload.chatLore.push({ ...ent, world: bookName });
+                        try {
+                            let data = null;
+                            if (typeof worldInfoModRef?.loadWorldInfo === 'function') {
+                                data = await worldInfoModRef.loadWorldInfo(bookName);
+                            } else {
+                                const r = await fetch('/api/worldinfo/get', {
+                                    method: 'POST', headers: stApi.getRequestHeaders(), body: JSON.stringify({ name: bookName }),
+                                });
+                                if (r.ok) data = await r.json();
                             }
-                            alreadyLoaded.add(bookName);
+                            if (data?.entries && typeof data.entries === 'object') {
+                                for (const [dictKey, ent] of Object.entries(data.entries)) {
+                                    if (!ent || typeof ent !== 'object') continue;
+                                    const resolvedUid = (ent.uid !== undefined && ent.uid !== null && ent.uid !== '')
+                                        ? ent.uid
+                                        : (Number.isNaN(Number(dictKey)) ? dictKey : Number(dictKey));
+                                    const { uid: _ignored, ...rest } = ent;
+                                    loadedEntries.push({ uid: resolvedUid, world: bookName, ...rest });
+                                }
+                                alreadyLoaded.add(bookName);
+                            }
+                        } catch (bookErr) {
+                            console.warn(`[PocketCodex] Skipping broken extra chat lorebook "${bookName}":`, bookErr);
                         }
+                    }
+                    const chatIdNow = stApi.ctx?.getCurrentChatId?.() || stApi.ctx?.chatId || '';
+                    if (stApi.isChatOpen() && chatIdNow === chatIdAtStart) {
+                        payload.chatLore.push(...loadedEntries);
                     }
                 } catch (err) {
                     console.warn('[PocketCodex] Extra chat lorebooks load warning:', err);
+                }
+            };
+            evSource.on(evTypes.WORLDINFO_ENTRIES_LOADED, loadExtraChatLore);
+            evSource.makeFirst?.(evTypes.WORLDINFO_ENTRIES_LOADED, loadExtraChatLore);
+        }
+        if (evTypes.WORLDINFO_UPDATED) {
+            evSource.on(evTypes.WORLDINFO_UPDATED, (bookName, bookData) => {
+                const changed = forgeCtrl?.onExternalWorldInfoUpdated?.(bookName, bookData);
+                if (!changed) return;
+                const dlg = document.getElementById('pcx-dialog');
+                const isEditingAny = uiState.view === 'edit' || uiState.view === 'section_editor' || forgeCtrl?.isEditingForm;
+                if (dlg?.open && !isEditingAny) {
+                    renderModal({ preserveTabsScroll: true, preserveBodyScroll: true });
+                }
+            });
+        }
+        if (evTypes.WORLD_INFO_ACTIVATED) {
+            evSource.on(evTypes.WORLD_INFO_ACTIVATED, (activatedList) => {
+                lastActivatedWiKeys.clear();
+                if (Array.isArray(activatedList)) {
+                    for (const ent of activatedList) {
+                        if (ent && ent.world !== undefined && ent.uid !== undefined) {
+                            lastActivatedWiKeys.add(`${ent.world}::${ent.uid}`);
+                        }
+                    }
+                }
+                const dlg = document.getElementById('pcx-dialog');
+                const isEditingAny = uiState.view === 'edit' || uiState.view === 'section_editor' || forgeCtrl?.isEditingForm;
+                if (dlg?.open && !isEditingAny) {
+                    renderModal({ preserveTabsScroll: true, preserveBodyScroll: true });
                 }
             });
         }
         for (const ev of [evTypes.CHAT_CHANGED, evTypes.GENERATION_STARTED, evTypes.MESSAGE_SENT, evTypes.MESSAGE_RECEIVED, evTypes.MESSAGE_DELETED, evTypes.WORLDINFO_SETTINGS_UPDATED].filter(Boolean)) {
             evSource.on(ev, () => {
-                if (ev === evTypes.CHAT_CHANGED) resetEditDrafts();
+                if (ev === evTypes.GENERATION_STARTED) {
+                    lastActivatedWiKeys.clear();
+                }
+                if (ev === evTypes.CHAT_CHANGED) {
+                    codexAiSeq++;
+                    lastActivatedWiKeys.clear();
+                    stApi.cancelPendingChatSaves();
+                    resetEditDrafts();
+                    forgeCtrl?.resetTransientState?.();
+                }
                 updateExtensionPrompt();
                 const dlg = document.getElementById('pcx-dialog');
-                if (dlg?.open && (ev === evTypes.CHAT_CHANGED || ev === evTypes.WORLDINFO_SETTINGS_UPDATED || ev === evTypes.MESSAGE_SENT || ev === evTypes.MESSAGE_RECEIVED)) {
+                if (!dlg?.open) return;
+                if (ev === evTypes.CHAT_CHANGED) {
+                    renderModal({ preserveTabsScroll: true, preserveBodyScroll: true });
+                    return;
+                }
+                const isEditingAny = uiState.view === 'edit' || uiState.view === 'section_editor' || forgeCtrl?.isEditingForm;
+                if (!isEditingAny && (ev === evTypes.WORLDINFO_SETTINGS_UPDATED || ev === evTypes.MESSAGE_SENT || ev === evTypes.MESSAGE_RECEIVED)) {
                     renderModal({ preserveTabsScroll: true, preserveBodyScroll: true });
                 }
             });

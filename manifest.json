@@ -6,6 +6,6 @@
     "js": "suite_entry.js",
     "css": "suite_styles.css",
     "author": "Gerodot535",
-    "version": "0.9.9-beta",
+    "version": "1.0.1-beta",
     "homePage": "https://github.com/Gerodot535/st-pocket-codex"
 }

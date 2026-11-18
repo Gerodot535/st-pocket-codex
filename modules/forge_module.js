@@ -4,6 +4,11 @@ import {
     formatCleanParagraphs,
     analyzeBookRecursion,
     buildEntryCountPhrase,
+    parseSmartTriggerKeys,
+    isSchemaUnsupportedError,
+    unwrapAndParseModelJson,
+    matchTriggerKeyInText,
+    checkEntrySecondaryKeysInText,
     tUi,
 } from './presets_and_i18n.js';
 
@@ -65,30 +70,104 @@ const KEYS_ONLY_JSON_SCHEMA = {
     },
 };
 
-function makeStandardWiEntry(uid, item = {}) {
+const VERBATIM_META_JSON_SCHEMA = {
+    name: 'lorebook_verbatim_metadata',
+    strict: true,
+    value: {
+        type: 'object',
+        properties: {
+            items: {
+                type: 'array',
+                items: {
+                    type: 'object',
+                    properties: {
+                        index: { type: 'number' },
+                        comment: { type: 'string' },
+                        keys: { type: 'array', items: { type: 'string' } },
+                        constant: { type: 'boolean' },
+                        position: { type: 'number' },
+                        depth: { type: 'number' },
+                    },
+                    required: ['index', 'comment', 'keys', 'constant', 'position', 'depth'],
+                    additionalProperties: false,
+                },
+            },
+        },
+        required: ['items'],
+        additionalProperties: false,
+    },
+};
+
+function parseSafeDepth(val, fallback = 4) {
+    if (val === undefined || val === null || val === '') return fallback;
+    const n = Number(val);
+    return Number.isFinite(n) ? Math.max(0, Math.floor(n)) : fallback;
+}
+
+function parseSafePosition(val, fallback = 1) {
+    const n = Number(val);
+    return Number.isInteger(n) && n >= 0 && n <= 7 ? n : fallback;
+}
+
+function renderPositionOptions(selectedPos, uiLang = 'ru') {
+    const p = parseSafePosition(selectedPos, 1);
+    const opts = [
+        [0, tUi(uiLang, 'До описания чара', 'Before Char Defs')],
+        [1, tUi(uiLang, 'После описания чара', 'After Char Defs')],
+        [2, tUi(uiLang, 'До Заметок Автора (AN)', 'Before Author\'s Note')],
+        [3, tUi(uiLang, 'После Заметок Автора (AN)', 'After Author\'s Note')],
+        [4, tUi(uiLang, 'В глубине чата (@ Depth)', 'In-Chat @ Depth')],
+        [5, tUi(uiLang, 'Перед примерами речи', 'Top of Examples')],
+        [6, tUi(uiLang, 'После примеров речи', 'Bottom of Examples')],
+        [7, tUi(uiLang, 'Шлюз Outlet', 'Outlet')],
+    ];
+    return opts.map(([val, label]) => `<option value="${val}" ${p === val ? 'selected' : ''}>${label}</option>`).join('');
+}
+
+function makeStandardWiEntry(uid, item = {}, wiTemplate = null) {
     const numUid = Number(uid);
     const rawKeys = item.key !== undefined ? item.key : item.keys;
-    const keysArr = Array.isArray(rawKeys)
-        ? rawKeys.map(k => String(k).trim()).filter(Boolean)
-        : String(rawKeys || '').split(',').map(k => k.trim()).filter(Boolean);
+    const keysArr = parseSmartTriggerKeys(rawKeys);
+    const base = (wiTemplate && typeof wiTemplate === 'object')
+        ? JSON.parse(JSON.stringify(wiTemplate))
+        : {};
     return {
-        uid: numUid, key: keysArr, keysecondary: Array.isArray(item.keysecondary) ? item.keysecondary : [],
+        ...base,
+        uid: numUid,
+        key: keysArr,
+        keysecondary: Array.isArray(item.keysecondary) ? item.keysecondary : [],
         comment: String(item.comment || 'Статья лора').trim().slice(0, 95),
         content: String(item.content || '').trim(),
-        constant: Boolean(item.constant), vectorized: Boolean(item.vectorized),
-        selective: true, selectiveLogic: 0, addMemo: true,
-        order: Number(item.order) || 100,
-        position: item.position !== undefined ? Number(item.position) : 1,
+        constant: Boolean(item.constant),
+        vectorized: Boolean(item.vectorized),
+        selective: item.selective !== undefined ? Boolean(item.selective) : true,
+        selectiveLogic: Number(item.selectiveLogic) || 0,
+        addMemo: true,
+        order: Number.isFinite(Number(item.order)) ? Number(item.order) : 100,
+        position: parseSafePosition(item.position, 1),
         disable: Boolean(item.disable),
         excludeRecursion: Boolean(item.excludeRecursion),
         preventRecursion: Boolean(item.preventRecursion),
-        delayUntilRecursion: Boolean(item.delayUntilRecursion),
-        probability: 100, useProbability: true,
-        depth: item.depth !== undefined ? Math.max(0, Number(item.depth) || 0) : 4,
-        group: '', groupOverride: false, groupWeight: 100,
-        scanDepth: null, caseSensitive: null, matchWholeWords: null, useGroupScoring: null,
-        automationId: '', role: item.role !== undefined ? Number(item.role) : 0,
-        sticky: 0, cooldown: 0, delay: 0, displayIndex: numUid,
+        delayUntilRecursion: typeof base.delayUntilRecursion === 'number'
+            ? (Number(item.delayUntilRecursion) || 0)
+            : Boolean(item.delayUntilRecursion),
+        probability: Number.isFinite(Number(item.probability)) ? Number(item.probability) : 100,
+        useProbability: item.useProbability !== undefined ? Boolean(item.useProbability) : true,
+        depth: parseSafeDepth(item.depth, 4),
+        outletName: String(item.outletName || '').trim(),
+        group: item.group || '',
+        groupOverride: Boolean(item.groupOverride),
+        groupWeight: Number.isFinite(Number(item.groupWeight)) ? Number(item.groupWeight) : 100,
+        scanDepth: item.scanDepth ?? null,
+        caseSensitive: item.caseSensitive ?? null,
+        matchWholeWords: item.matchWholeWords ?? null,
+        useGroupScoring: item.useGroupScoring ?? null,
+        automationId: item.automationId || '',
+        role: item.role !== undefined ? Number(item.role) : 0,
+        sticky: item.sticky !== undefined && item.sticky !== null ? Number(item.sticky) : (base.sticky ?? null),
+        cooldown: item.cooldown !== undefined && item.cooldown !== null ? Number(item.cooldown) : (base.cooldown ?? null),
+        delay: item.delay !== undefined && item.delay !== null ? Number(item.delay) : (base.delay ?? null),
+        displayIndex: Number.isFinite(Number(item.displayIndex)) ? Number(item.displayIndex) : numUid,
     };
 }
 
@@ -121,10 +200,21 @@ export function createForgeController(deps) {
 
         newBookName: '',
         newBookCover: '',
-        newBookBindScope: 'global',
+        newBookBindScope: 'none',
+
+        shelfQuery: '',
+        shelfFilter: 'all',
+        entryQuery: '',
+        entryFilter: 'all',
+        saveError: '',
+        lastDeletedEntry: null,
 
         // Single-page editor (manual + AI co-author with presets & word limits)
         editingUid: null,
+        editingOriginBookId: '',
+        entryOriginalKeys: null,
+        entryKeysRawText: '',
+        entryKeysDirty: false,
         entryDraft: null,
         entryTargetBookId: '',
         entryEditTab: 'manual',
@@ -149,7 +239,7 @@ export function createForgeController(deps) {
         wizUseChat: true,
         wizChatCount: 12,
         wizSelectedCats: {},
-        wizMuteExportedCats: true,
+        wizMuteExportedCats: false,
         wizUploadedDocs: [],
         wizCustomPrompt: '',
         wizMode: 'ai_adapt',
@@ -162,8 +252,32 @@ export function createForgeController(deps) {
         targetBookName: '',
         targetExistingId: '',
         targetCover: '',
-        bindAfterScope: 'global',
+        bindAfterScope: 'none',
     };
+
+    let bookLoadSeq = 0;
+    let forgeAiSeq = 0;
+    let recCacheSig = '';
+    let recCacheValue = null;
+
+    function getCachedRecursionReport(entriesObj) {
+        const entries = Object.values(entriesObj || {});
+        const parts = [stApi.ctx?.name1, stApi.ctx?.name2].filter(Boolean);
+        const wiMod = stApi.worldInfoMod;
+        const sig = JSON.stringify({
+            parts,
+            ww: wiMod?.world_info_match_whole_words,
+            cs: wiMod?.world_info_case_sensitive,
+            items: entries.map(e => [e?.uid, e?.disable, e?.constant, e?.preventRecursion, e?.excludeRecursion, e?.key, e?.keysecondary, e?.selective, e?.selectiveLogic, e?.matchWholeWords, e?.caseSensitive, (e?.content || '').length, (e?.content || '').slice(0, 64)]),
+        });
+        if (sig === recCacheSig && recCacheValue) return recCacheValue;
+        recCacheSig = sig;
+        recCacheValue = analyzeBookRecursion(entriesObj, parts, {
+            matchWholeWords: wiMod?.world_info_match_whole_words,
+            caseSensitive: wiMod?.world_info_case_sensitive,
+        });
+        return recCacheValue;
+    }
 
     function getBookCollapsedMap(bookId) {
         const s = ensureSettings();
@@ -183,103 +297,204 @@ export function createForgeController(deps) {
 
     async function callForgeModel(systemPrompt, userPrompt, schemaObj, maxTokens = 3800) {
         const s = ensureSettings();
-        const profileId = s.aiProfileId || '';
+        const uiLang = s.uiLang || 'ru';
+        const profileId = (s.aiProfileId || '').trim();
         const service = stApi.connectionService;
-        if (profileId && service && typeof service.sendRequest === 'function') {
+
+        if (profileId) {
+            if (!service || typeof service.sendRequest !== 'function') {
+                throw new Error(tUi(
+                    uiLang,
+                    'Сервис профилей подключения SillyTavern недоступен. Выберите «[ Текущее подключение ]» или включите Connection Manager.',
+                    'SillyTavern Connection Manager is unavailable. Select "[ Current Connection ]" or enable Connection Manager.',
+                ));
+            }
             const chosen = getConnectionProfiles().find(p => p.id === profileId);
-            if (chosen) {
-                const isTc = chosen.mode === 'tc';
-                const payload = isTc
-                    ? `${systemPrompt}\n\n${userPrompt}`
-                    : [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }];
-                try {
-                    return await service.sendRequest(
-                        profileId, payload, maxTokens,
-                        { stream: false, extractData: true, includePreset: false, includeInstruct: false },
-                        isTc ? {} : { response_format: { type: 'json_schema', json_schema: { name: schemaObj.name, strict: true, schema: schemaObj.value } } },
-                    );
-                } catch {
-                    return await service.sendRequest(
-                        profileId, payload, maxTokens,
-                        { stream: false, extractData: true, includePreset: false, includeInstruct: false },
-                    );
-                }
+            if (!chosen) {
+                throw new Error(tUi(
+                    uiLang,
+                    'Выбранный профиль подключения ИИ больше не существует. Выберите другой профиль в списке.',
+                    'The selected AI Connection Profile no longer exists. Please choose another profile.',
+                ));
+            }
+            const isTc = chosen.mode === 'tc';
+            const payload = isTc
+                ? `${systemPrompt}\n\n${userPrompt}`
+                : [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }];
+            if (isTc || !schemaObj) {
+                return await service.sendRequest(
+                    profileId, payload, maxTokens,
+                    { stream: false, extractData: true, includePreset: false, includeInstruct: false },
+                );
+            }
+            try {
+                return await service.sendRequest(
+                    profileId, payload, maxTokens,
+                    { stream: false, extractData: true, includePreset: false, includeInstruct: false },
+                    { json_schema: schemaObj },
+                );
+            } catch (err) {
+                if (!isSchemaUnsupportedError(err)) throw err;
+                return await service.sendRequest(
+                    profileId, payload, maxTokens,
+                    { stream: false, extractData: true, includePreset: false, includeInstruct: false },
+                );
             }
         }
         return await stApi.generateWithSchemaFallback(systemPrompt, userPrompt, schemaObj);
     }
 
-    function parseJsonObjectFromModel(raw) {
-        if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
-            if (raw.entries || raw.content !== undefined || raw.keys !== undefined) return raw;
-        }
-        let txt = typeof raw === 'string'
-            ? raw
-            : (raw?.content || raw?.choices?.[0]?.message?.content || raw?.text || '');
-        txt = String(txt || '')
-            .replace(/<think>[\s\S]*?<\/think>/gi, '')
-            .replace(/^```(?:json)?\s*/i, '')
-            .replace(/\s*```$/i, '')
-            .trim();
-        const fb = txt.indexOf('{'), lb = txt.lastIndexOf('}');
-        if (fb !== -1 && lb > fb) return JSON.parse(txt.slice(fb, lb + 1));
-        return null;
+    function parseJsonObjectFromModel(raw, expectedKind = 'any') {
+        return unwrapAndParseModelJson(raw, expectedKind);
     }
 
-    async function fetchBooksList() {
+    async function fetchBooksList({ strict = false } = {}) {
         state.loading = true;
         try {
             const res = await fetch('/api/worldinfo/list', {
                 method: 'POST', headers: stApi.getRequestHeaders(), body: JSON.stringify({}),
             });
-            if (res.ok) {
-                state.books = await res.json();
-                hydrateBookCountsInBackground(state.books);
+            if (!res.ok) {
+                throw new Error(`HTTP ${res.status} /api/worldinfo/list`);
             }
-        } catch (err) { console.warn('[Forge] List error:', err); }
-        finally { state.loading = false; }
+            const list = await res.json();
+            if (!Array.isArray(list)) {
+                throw new Error('Invalid /api/worldinfo/list payload');
+            }
+            state.books = list;
+            hydrateBookCountsInBackground(state.books);
+            return list;
+        } catch (err) {
+            console.warn('[Forge] List error:', err);
+            if (strict) throw err;
+            return state.books;
+        } finally {
+            state.loading = false;
+        }
     }
 
+    let hydratingCounts = false;
     async function hydrateBookCountsInBackground(booksList) {
-        const missing = (booksList || []).filter(b => state.bookCounts[b.file_id] === undefined).slice(0, 40);
+        if (hydratingCounts) return;
+        const missing = (booksList || []).filter(b => state.bookCounts[b.file_id] === undefined);
         if (!missing.length) return;
-        let changed = false;
-        await Promise.all(missing.map(async (b) => {
-            try {
-                const data = await loadBookData(b.file_id);
-                state.bookCounts[b.file_id] = Object.keys(data.entries || {}).length;
-                if (data.extensions?.pocket_codex_cover && (!b.extensions || !b.extensions.pocket_codex_cover)) {
-                    b.extensions = b.extensions || {};
-                    b.extensions.pocket_codex_cover = data.extensions.pocket_codex_cover;
-                }
-                changed = true;
-            } catch {}
-        }));
-        if (changed && state.screen === 'shelf') requestRender({ preserveBodyScroll: true });
+        hydratingCounts = true;
+        try {
+            const chunkSize = 6;
+            for (let i = 0; i < missing.length; i += chunkSize) {
+                const batch = missing.slice(i, i + chunkSize);
+                let changed = false;
+                await Promise.all(batch.map(async (b) => {
+                    try {
+                        const data = await loadBookData(b.file_id);
+                        state.bookCounts[b.file_id] = Object.keys(data.entries || {}).length;
+                        if (data.extensions?.pocket_codex_cover && (!b.extensions || !b.extensions.pocket_codex_cover)) {
+                            b.extensions = b.extensions || {};
+                            b.extensions.pocket_codex_cover = data.extensions.pocket_codex_cover;
+                        }
+                        changed = true;
+                    } catch {}
+                }));
+                if (changed && state.screen === 'shelf') requestRender({ preserveBodyScroll: true });
+            }
+        } finally {
+            hydratingCounts = false;
+        }
     }
 
-    async function loadBookData(fileId) {
-        const res = await fetch('/api/worldinfo/get', {
-            method: 'POST', headers: stApi.getRequestHeaders(), body: JSON.stringify({ name: fileId }),
-        });
-        if (!res.ok) throw new Error('Не удалось загрузить файл Лорбука.');
-        const data = await res.json();
+    function normalizeLoadedEntries(data) {
+        if (!data || typeof data !== 'object') return { entries: {}, extensions: {} };
         if (!data.entries || typeof data.entries !== 'object') data.entries = {};
         if (!data.extensions || typeof data.extensions !== 'object') data.extensions = {};
+        for (const [k, ent] of Object.entries(data.entries)) {
+            if (!ent || typeof ent !== 'object') {
+                delete data.entries[k];
+                continue;
+            }
+            if (ent.uid === undefined || ent.uid === null || ent.uid === '') {
+                const numK = Number(k);
+                ent.uid = Number.isNaN(numK) ? k : numK;
+            }
+        }
+        return data;
+    }
+
+    const bookWriteQueues = new Map();
+    const savingBooksNow = new Set();
+
+    function enqueueBookWrite(fileId, taskFn) {
+        const key = String(fileId || '');
+        const prev = bookWriteQueues.get(key) || Promise.resolve();
+        const next = prev.catch(() => {}).then(() => taskFn());
+        bookWriteQueues.set(key, next.finally(() => {
+            if (bookWriteQueues.get(key) === next) bookWriteQueues.delete(key);
+        }));
+        return next;
+    }
+
+    async function loadBookData(fileId, { preferCache = true } = {}) {
+        const wiCache = stApi.worldInfoMod?.worldInfoCache;
+        if (preferCache && wiCache && typeof wiCache.has === 'function' && wiCache.has(fileId)) {
+            const cached = wiCache.get(fileId);
+            if (cached && typeof cached === 'object') {
+                const cloned = normalizeLoadedEntries(JSON.parse(JSON.stringify(cached)));
+                state.bookCounts[fileId] = Object.keys(cloned.entries).length;
+                return cloned;
+            }
+        }
+        const res = await fetch('/api/worldinfo/get', {
+            method: 'POST', headers: stApi.getRequestHeaders(), body: JSON.stringify({ name: fileId }), cache: 'no-cache',
+        });
+        if (!res.ok) throw new Error(`Не удалось загрузить файл Лорбука (HTTP ${res.status}).`);
+        const data = normalizeLoadedEntries(await res.json());
+        try { wiCache?.set?.(fileId, JSON.parse(JSON.stringify(data))); } catch {}
         state.bookCounts[fileId] = Object.keys(data.entries).length;
         return data;
     }
 
+    async function openBookAtomic(fileId) {
+        const seq = ++bookLoadSeq;
+        state.saveError = '';
+        const data = await loadBookData(fileId);
+        if (seq !== bookLoadSeq) return null;
+        state.activeBookId = fileId;
+        state.activeBookData = data;
+        return data;
+    }
+
     async function saveBookData(fileId, data) {
-        const res = await fetch('/api/worldinfo/edit', {
-            method: 'POST', headers: stApi.getRequestHeaders(), body: JSON.stringify({ name: fileId, data }),
-        });
-        if (!res.ok) {
-            const errTxt = await res.text().catch(() => '');
-            throw new Error(`Ошибка сохранения Лорбука (HTTP ${res.status})${errTxt ? ': ' + errTxt.slice(0, 120) : ''}`);
+        const payload = JSON.parse(JSON.stringify(normalizeLoadedEntries(data)));
+        savingBooksNow.add(fileId);
+        try {
+            const res = await fetch('/api/worldinfo/edit', {
+                method: 'POST', headers: stApi.getRequestHeaders(), body: JSON.stringify({ name: fileId, data: payload }),
+            });
+            if (!res.ok) {
+                const errTxt = await res.text().catch(() => '');
+                throw new Error(`Ошибка сохранения Лорбука (HTTP ${res.status})${errTxt ? ': ' + errTxt.slice(0, 120) : ''}`);
+            }
+            state.bookCounts[fileId] = Object.keys(payload.entries || {}).length;
+            state.saveError = '';
+            await stApi.syncWorldInfoAfterSave?.(fileId, payload);
+            await stApi.refreshWorldInfoUI();
+            return payload;
+        } finally {
+            savingBooksNow.delete(fileId);
         }
-        state.bookCounts[fileId] = Object.keys(data?.entries || {}).length;
-        await stApi.refreshWorldInfoUI();
+    }
+
+    async function mutateBookAtomically(fileId, mutatorFn) {
+        return enqueueBookWrite(fileId, async () => {
+            const fresh = await loadBookData(fileId);
+            const workingCopy = JSON.parse(JSON.stringify(fresh));
+            const resVal = await mutatorFn(workingCopy);
+            if (resVal === false) return null;
+            const saved = await saveBookData(fileId, workingCopy);
+            if (state.activeBookId === fileId) {
+                state.activeBookData = saved;
+            }
+            return saved;
+        });
     }
 
     function getChatBoundBooks() {
@@ -321,46 +536,83 @@ export function createForgeController(deps) {
         }
     }
 
-    function scanEntryAgainstRecentChat(ent) {
-        if (ent.disable) return { live: false, hitKeys: [], label: 'Страница выключена тумблером' };
-        if (ent.constant) return { live: true, hitKeys: [], label: 'Постоянно: всегда передаётся в промпт' };
+    function scanEntryAgainstRecentChat(ent, bookId = state.activeBookId) {
+        const uiLang = ensureSettings().uiLang || 'ru';
+        const inLastPrompt = Boolean(bookId && stApi.wasWiEntryActivated?.(bookId, ent.uid));
+        if (ent.disable) return { live: false, inLastPrompt: false, hitKeys: [], label: tUi(uiLang, 'Страница выключена тумблером', 'Muted via toggle') };
+        if (ent.constant) {
+            return {
+                live: true,
+                inLastPrompt,
+                hitKeys: [],
+                label: inLastPrompt
+                    ? tUi(uiLang, 'Постоянно • Попала в последний промпт', 'Constant • Sent in last prompt')
+                    : tUi(uiLang, 'Постоянно: всегда готова к отправке', 'Constant: always active when book is bound'),
+            };
+        }
         if (ent.vectorized && (!Array.isArray(ent.key) || ent.key.length === 0)) {
-            return { live: false, hitKeys: [], label: 'Вектор: активируется по смыслу через Vector Storage' };
+            return {
+                live: inLastPrompt,
+                inLastPrompt,
+                hitKeys: [],
+                label: inLastPrompt
+                    ? tUi(uiLang, 'Вектор • Попала в последний промпт', 'Vector • Sent in last prompt')
+                    : tUi(uiLang, 'Вектор: активируется по смыслу (Vector Storage)', 'Vector: activates via semantic similarity'),
+            };
         }
         const keys = Array.isArray(ent.key) ? ent.key.map(k => String(k).trim()).filter(Boolean) : [];
-        if (!keys.length) return { live: false, hitKeys: [], label: 'Нет ключевых слов — добавь ключи или выбери «Постоянно»' };
-        if (!stApi.isChatOpen()) return { live: false, hitKeys: [], label: 'Ждёт упоминания ключей в чате' };
+        if (!keys.length) return { live: false, inLastPrompt: false, hitKeys: [], label: tUi(uiLang, 'Нет ключевых слов — добавь ключи или выбери «Постоянно»', 'No trigger keys — add keys or switch to Constant') };
+        if (!stApi.isChatOpen()) return { live: false, inLastPrompt: false, hitKeys: [], label: tUi(uiLang, 'Ждёт упоминания ключей в чате', 'Waiting for trigger keys in chat') };
 
         const wiMod = stApi.worldInfoMod;
         const depth = Math.max(1, Number(ent.scanDepth ?? wiMod?.world_info_depth ?? 2) || 2);
         const includeNames = wiMod?.world_info_include_names !== false;
+        const wholeWords = (ent.matchWholeWords !== null && ent.matchWholeWords !== undefined)
+            ? Boolean(ent.matchWholeWords)
+            : (wiMod?.world_info_match_whole_words !== undefined ? Boolean(wiMod.world_info_match_whole_words) : true);
+        const caseSens = (ent.caseSensitive !== null && ent.caseSensitive !== undefined)
+            ? Boolean(ent.caseSensitive)
+            : Boolean(wiMod?.world_info_case_sensitive);
+
         const chatArr = Array.isArray(stApi.ctx?.chat) ? stApi.ctx.chat : [];
         const recent = chatArr.filter(m => m && !m.is_system && typeof m.mes === 'string').slice(-depth);
-        if (!recent.length) return { live: false, hitKeys: [], label: `Спит (сканирует последние ${depth} сообщ.)` };
+        if (!recent.length) return { live: inLastPrompt, inLastPrompt, hitKeys: [], label: tUi(uiLang, `Спит (сканирует последние ${depth} сообщ.)`, `Idle (scans last ${depth} msgs)`) };
 
-        const haystack = recent.map(m => includeNames && m.name ? `${m.name}: ${m.mes}` : m.mes).join('\n').toLowerCase();
+        const rawHaystack = recent.map(m => includeNames && m.name ? `${m.name}: ${m.mes}` : m.mes).join('\n');
+        const lowHaystack = rawHaystack.toLowerCase();
         const participantNames = [stApi.ctx?.name1, stApi.ctx?.name2].filter(Boolean).map(n => String(n).toLowerCase());
         const hitKeys = [];
         let matchedParticipantName = false;
 
         for (const k of keys) {
-            const low = k.toLowerCase();
-            if (!low) continue;
-            if (haystack.includes(low)) {
+            if (matchTriggerKeyInText(lowHaystack, rawHaystack, k, wholeWords, caseSens)) {
                 hitKeys.push(k);
-                if (includeNames && participantNames.includes(low)) matchedParticipantName = true;
+                if (includeNames && participantNames.includes(k.toLowerCase())) matchedParticipantName = true;
             }
         }
 
-        if (hitKeys.length > 0) {
-            const warnName = matchedParticipantName ? ' (имя собеседника есть в каждой реплике)' : '';
+        const secOk = checkEntrySecondaryKeysInText(lowHaystack, rawHaystack, ent, wholeWords, caseSens);
+        if (hitKeys.length > 0 && secOk) {
+            const warnName = matchedParticipantName ? tUi(uiLang, ' (имя участника чата)', ' (matches participant name)') : '';
+            const prefix = inLastPrompt
+                ? tUi(uiLang, 'В последнем промпте • ключ: ', 'In last prompt • key: ')
+                : tUi(uiLang, 'Ключ замечен в чате: ', 'Key noticed in chat: ');
             return {
                 live: true,
+                inLastPrompt,
                 hitKeys,
-                label: `Активна в чате — ключ: ${hitKeys.slice(0, 3).join(', ')}${warnName}`,
+                label: `${prefix}${hitKeys.slice(0, 3).join(', ')}${warnName}`,
             };
         }
-        return { live: false, hitKeys: [], label: `Спит — ждёт ключ в последних ${depth} сообщ.` };
+        if (inLastPrompt) {
+            return {
+                live: true,
+                inLastPrompt: true,
+                hitKeys,
+                label: tUi(uiLang, 'Попала в последний промпт (по рекурсии / sticky)', 'Sent in last prompt (via recursion / sticky)'),
+            };
+        }
+        return { live: false, inLastPrompt: false, hitKeys: [], label: tUi(uiLang, `Спит — ждёт ключ в последних ${depth} сообщ.`, `Idle — waiting for key in last ${depth} msgs`) };
     }
 
     function renderBindPills(fileId) {
@@ -386,46 +638,79 @@ export function createForgeController(deps) {
             </div>`;
     }
 
-    function openEntryEditor({ bookId, uid = null, initialTab = 'manual' }) {
-        state.entryTargetBookId = bookId || state.activeBookId || (state.books[0]?.file_id || '');
+    function openEntryEditor({ bookId, uid = null, initialTab = 'manual', bookData = null }) {
+        const resolvedBookId = bookId || state.activeBookId || (state.books[0]?.file_id || '');
+        const sourceBook = bookData || (resolvedBookId === state.activeBookId ? state.activeBookData : null);
+        state.entryTargetBookId = resolvedBookId;
+        state.editingOriginBookId = uid !== null ? resolvedBookId : '';
         state.editingUid = uid;
         state.entryEditTab = initialTab;
         state.pageAiStatus = '';
         state.pageAiCandidates = [];
         state.pageAiCandIdx = 0;
         state.pageAiRefineText = '';
+        state.saveError = '';
 
-        if (uid !== null && state.activeBookData?.entries?.[uid]) {
-            state.entryDraft = JSON.parse(JSON.stringify(state.activeBookData.entries[uid]));
+        if (uid !== null && sourceBook?.entries?.[uid]) {
+            state.entryDraft = JSON.parse(JSON.stringify(sourceBook.entries[uid]));
+            state.entryOriginalKeys = Array.isArray(state.entryDraft.key) ? [...state.entryDraft.key] : [];
+            state.entryKeysRawText = state.entryOriginalKeys.join(', ');
+            state.entryKeysDirty = false;
         } else {
-            state.entryDraft = makeStandardWiEntry(0, { comment: '', keys: [], content: '', position: 1, depth: 4 });
+            state.entryDraft = makeStandardWiEntry(0, { comment: '', keys: [], content: '', position: 1, depth: 4, outletName: '' }, stApi.worldInfoMod?.newWorldInfoEntryTemplate);
+            state.entryOriginalKeys = [];
+            state.entryKeysRawText = '';
+            state.entryKeysDirty = false;
         }
         state.screen = 'entry_edit';
     }
 
     async function saveDraftToTargetBook(draftObj) {
-        const targetBookId = state.editingUid !== null ? state.activeBookId : (state.entryTargetBookId || state.activeBookId);
-        if (!targetBookId) return;
-        const bookObj = (targetBookId === state.activeBookId && state.activeBookData)
-            ? state.activeBookData
-            : await loadBookData(targetBookId);
-        const entries = bookObj.entries;
-        if (state.editingUid !== null && entries[state.editingUid]) {
-            entries[state.editingUid] = { ...draftObj, uid: Number(state.editingUid) };
+        const isEditingExisting = state.editingUid !== null;
+        const targetBookId = isEditingExisting
+            ? (state.editingOriginBookId || state.activeBookId)
+            : (state.entryTargetBookId || state.activeBookId);
+        if (!targetBookId) return false;
+
+        const cleanDraft = JSON.parse(JSON.stringify(draftObj));
+        if (!state.entryKeysDirty && Array.isArray(state.entryOriginalKeys) && isEditingExisting) {
+            cleanDraft.key = [...state.entryOriginalKeys];
         } else {
-            const uids = Object.keys(entries).map(Number).filter(n => !Number.isNaN(n));
-            const nextUid = uids.length > 0 ? (Math.max(...uids) + 1) : 0;
-            entries[String(nextUid)] = makeStandardWiEntry(nextUid, { ...draftObj, keys: draftObj.key });
+            cleanDraft.key = parseSmartTriggerKeys(cleanDraft.key);
         }
-        await saveBookData(targetBookId, bookObj);
-        state.activeBookId = targetBookId;
-        state.activeBookData = bookObj;
-        state.screen = 'book_entries';
+        cleanDraft.position = parseSafePosition(cleanDraft.position, 1);
+        cleanDraft.depth = parseSafeDepth(cleanDraft.depth, 4);
+
+        try {
+            const editUidStr = String(state.editingUid);
+            const savedBook = await mutateBookAtomically(targetBookId, (freshBook) => {
+                const entries = freshBook.entries;
+                if (isEditingExisting && entries[editUidStr]) {
+                    const existingEntry = entries[editUidStr];
+                    const preservedUid = existingEntry.uid !== undefined ? existingEntry.uid : (Number.isNaN(Number(editUidStr)) ? editUidStr : Number(editUidStr));
+                    entries[editUidStr] = { ...existingEntry, ...cleanDraft, uid: preservedUid };
+                } else {
+                    const uids = Object.keys(entries).map(Number).filter(n => !Number.isNaN(n));
+                    const nextUid = uids.length > 0 ? (Math.max(...uids) + 1) : 0;
+                    entries[String(nextUid)] = makeStandardWiEntry(nextUid, { ...cleanDraft, keys: cleanDraft.key }, stApi.worldInfoMod?.newWorldInfoEntryTemplate);
+                }
+            });
+            state.activeBookId = targetBookId;
+            state.activeBookData = savedBook;
+            state.editingOriginBookId = '';
+            state.screen = 'book_entries';
+            return true;
+        } catch (err) {
+            state.saveError = err?.message || String(err);
+            return false;
+        }
     }
 
     async function generateKeysForCurrentDraft() {
         const d = state.entryDraft;
         if (!d || !String(d.content || '').trim() || state.keysGenerating) return;
+        const reqSeq = ++forgeAiSeq;
+        const chatAtStart = stApi.ctx?.getCurrentChatId?.() || stApi.ctx?.chatId || '';
         state.keysGenerating = true;
         requestRender({ preserveBodyScroll: true });
         try {
@@ -434,16 +719,23 @@ export function createForgeController(deps) {
             const sys = `Ты — мастер ключевых слов для интерактивных Лорбуков. Прочитай готовую статью и подбери 4–7 точных ключевых слов-триггеров на языке "${lang}" (имена собственные, локации, предметы, короткие корни без общих бытовых слов). Также предложи короткое название страницы (2–4 слова) в поле "comment". Верни строго JSON: { "comment": "...", "keys": ["..."] }.`;
             const usr = `[Название сейчас]: ${d.comment || '(пусто)'}\n[Текст страницы]:\n${d.content.trim()}`;
             const raw = await callForgeModel(sys, usr, KEYS_ONLY_JSON_SCHEMA, 1200);
-            const parsed = parseJsonObjectFromModel(raw);
-            if (parsed && Array.isArray(parsed.keys) && parsed.keys.length > 0) {
-                d.key = parsed.keys.map(k => String(k).trim()).filter(Boolean);
-                if (!String(d.comment || '').trim() && parsed.comment) d.comment = String(parsed.comment).trim();
+            if (reqSeq !== forgeAiSeq || (stApi.ctx?.getCurrentChatId?.() || stApi.ctx?.chatId || '') !== chatAtStart) return;
+            const parsed = parseJsonObjectFromModel(raw, 'keys');
+            const newKeys = parseSmartTriggerKeys(parsed?.keys);
+            if (!newKeys.length) {
+                throw new Error(tUi(s.uiLang || 'ru', 'Модель не вернула массив ключевых слов.', 'Model did not return a valid keys array.'));
             }
+            d.key = newKeys;
+            state.entryKeysRawText = newKeys.join(', ');
+            state.entryKeysDirty = true;
+            if (!String(d.comment || '').trim() && parsed?.comment) d.comment = String(parsed.comment).trim();
         } catch (err) {
             window.alert('Ошибка подбора ключей: ' + (err?.message || String(err)));
         } finally {
-            state.keysGenerating = false;
-            requestRender({ preserveBodyScroll: true });
+            if (reqSeq === forgeAiSeq) {
+                state.keysGenerating = false;
+                requestRender({ preserveBodyScroll: true });
+            }
         }
     }
 
@@ -455,7 +747,7 @@ export function createForgeController(deps) {
             const txt = String(e.content || '').trim();
             if (/\[[^\]\n]{2,60}\]/.test(txt)) bracketHeaders++;
             if (/^#{1,5}\s+/m.test(txt)) mdHeaders++;
-            if (/^[-*•]\s+/m.test(txt)) bulletLists++;
+            if (/^[-*]\s+/m.test(txt)) bulletLists++;
             if (/^[A-Za-zА-Яа-яЁё0-9 _-]{2,28}:\s+\S/m.test(txt)) colonFields++;
             totalParas += txt.split(/\n\s*\n/).filter(Boolean).length;
             totalWords += txt.split(/\s+/).filter(Boolean).length;
@@ -477,19 +769,22 @@ export function createForgeController(deps) {
     async function runSinglePageAiGeneration({ isRefinement = false, directSave = false } = {}) {
         if (state.pageAiGenerating) return;
         const s = ensureSettings();
+        const uiLang = s.uiLang || 'ru';
         const d = state.entryDraft;
         const prevCand = isRefinement ? state.pageAiCandidates[state.pageAiCandIdx] : null;
         if (isRefinement && (!prevCand || !state.pageAiRefineText.trim())) return;
         if (!isRefinement && !state.pageAiTask.trim() && !(d?.content || '').trim()) {
-            state.pageAiStatus = 'Опиши тему страницы выше (локацию, персонажа, предмет, закон мира).';
+            state.pageAiStatus = tUi(uiLang, 'Опиши тему страницы выше (локацию, персонажа, предмет, закон мира).', 'Describe the page topic above (location, NPC, relic, world rule).');
             requestRender({ preserveBodyScroll: true });
             return;
         }
 
+        const reqSeq = ++forgeAiSeq;
+        const chatAtStart = stApi.ctx?.getCurrentChatId?.() || stApi.ctx?.chatId || '';
         state.pageAiGenerating = true;
         state.pageAiStatus = directSave
-            ? 'Куём и сразу сохраняем страницу в Лорбук...'
-            : (isRefinement ? 'Соавтор вносит правки...' : 'Соавтор создаёт страницу и подбирает ключи...');
+            ? tUi(uiLang, 'Куём и сразу сохраняем страницу в Лорбук...', 'Forging and saving page to Lorebook...')
+            : (isRefinement ? tUi(uiLang, 'Соавтор вносит правки...', 'Refining candidate...') : tUi(uiLang, 'Соавтор создаёт страницу и подбирает ключи...', 'Drafting page & trigger keys...'));
         requestRender({ preserveBodyScroll: true });
 
         try {
@@ -528,23 +823,26 @@ export function createForgeController(deps) {
             }
 
             const raw = await callForgeModel(sysPrompt, blocks.join('\n\n'), SINGLE_PAGE_JSON_SCHEMA, Math.max(1200, Number(s.aiMaxTokens) || 3400));
-            const parsed = parseJsonObjectFromModel(raw);
-            const cleanBody = formatCleanParagraphs(parsed?.content || '');
+            if (reqSeq !== forgeAiSeq || (stApi.ctx?.getCurrentChatId?.() || stApi.ctx?.chatId || '') !== chatAtStart) return;
+            const parsed = parseJsonObjectFromModel(raw, 'page');
+            const rawBody = typeof parsed?.content === 'string' ? parsed.content : '';
+            const cleanBody = formatCleanParagraphs(rawBody);
             if (!parsed || !cleanBody) {
-                throw new Error('Модель не вернула текст страницы.');
+                throw new Error(tUi(uiLang, 'Модель не вернула корректный JSON страницы.', 'Model did not return a valid page JSON.'));
             }
 
-            const genKeysArr = Array.isArray(parsed.keys)
-                ? parsed.keys.map(k => String(k).trim()).filter(Boolean)
-                : String(parsed.keys || '').split(',').map(k => k.trim()).filter(Boolean);
+            const genKeysArr = parseSmartTriggerKeys(parsed.keys);
 
             if (directSave) {
                 d.comment = String(parsed.comment || d.comment || 'Новая страница').trim();
                 d.key = genKeysArr;
+                state.entryKeysRawText = genKeysArr.join(', ');
+                state.entryKeysDirty = true;
                 d.content = cleanBody;
                 d.constant = Boolean(parsed.constant);
-                state.pageAiTask = '';
-                await saveDraftToTargetBook(d);
+                const ok = await saveDraftToTargetBook(d);
+                if (ok) state.pageAiTask = '';
+                else state.pageAiStatus = 'Ошибка сохранения: ' + state.saveError;
                 return;
             }
 
@@ -556,12 +854,16 @@ export function createForgeController(deps) {
             });
             state.pageAiCandIdx = state.pageAiCandidates.length - 1;
             if (isRefinement) state.pageAiRefineText = '';
-            state.pageAiStatus = 'Вариант готов! Проверь отступы и ключи ниже.';
+            state.pageAiStatus = tUi(uiLang, 'Вариант готов! Проверь отступы и ключи ниже.', 'Draft ready! Review spacing and trigger keys below.');
         } catch (err) {
-            state.pageAiStatus = 'Ошибка: ' + (err?.message || String(err));
+            if (reqSeq === forgeAiSeq) {
+                state.pageAiStatus = 'Ошибка: ' + (err?.message || String(err));
+            }
         } finally {
-            state.pageAiGenerating = false;
-            requestRender({ preserveBodyScroll: true });
+            if (reqSeq === forgeAiSeq) {
+                state.pageAiGenerating = false;
+                requestRender({ preserveBodyScroll: true });
+            }
         }
     }
 
@@ -578,28 +880,31 @@ export function createForgeController(deps) {
             if (!cat) continue;
             for (const n of store.notes.filter(x => x.categoryId === catId && x.enabled !== false)) {
                 if (n.content && n.content.trim()) {
-                    selectedNotes.push({ section: cat.name, title: n.title || cat.name, content: n.content.trim() });
+                    selectedNotes.push({ section: cat.name, title: n.title || cat.name, content: n.content });
                 }
             }
         }
 
-        if (state.wizUseChar) { const cd = getCharacterDescriptionText(); if (cd) sourceBlocks.push(cd); }
-        if (state.wizUseScenario) {
-            const ctx = stApi.ctx;
-            const ch = (ctx.characterId !== undefined && Array.isArray(ctx.characters)) ? ctx.characters[ctx.characterId] : null;
-            const scen = ch?.scenario || ch?.data?.scenario || '';
-            const firstMes = ch?.first_mes || '';
-            if (scen || firstMes) sourceBlocks.push(`[Сценарий и завязка]\n${scen}\n${firstMes}`.trim());
+        // In verbatim_keys mode, NEVER silently send hidden chat/character switches — only send the verbatim items!
+        if (state.wizMode === 'ai_adapt') {
+            if (state.wizUseChar) { const cd = getCharacterDescriptionText(); if (cd) sourceBlocks.push(cd); }
+            if (state.wizUseScenario) {
+                const ctx = stApi.ctx;
+                const ch = (ctx.characterId !== undefined && Array.isArray(ctx.characters)) ? ctx.characters[ctx.characterId] : null;
+                const scen = ch?.scenario || ch?.data?.scenario || '';
+                const firstMes = ch?.first_mes || '';
+                if (scen || firstMes) sourceBlocks.push(`[Сценарий и завязка]\n${scen}\n${firstMes}`.trim());
+            }
+            if (state.wizUsePersona) { const pd = getUserPersonaDescriptionText(); if (pd) sourceBlocks.push(pd); }
+            if (state.wizUseChat) { const ct = buildChatContextSnippet(state.wizChatCount); if (ct) sourceBlocks.push(ct); }
+            if (state.wizUploadedDocs.length > 0) {
+                sourceBlocks.push('[Документы]\n' + state.wizUploadedDocs.map(d => `--- ${d.name} ---\n${d.text.slice(0, 14000)}`).join('\n\n'));
+            }
+            if (selectedNotes.length > 0) {
+                sourceBlocks.push('[Исходные заметки из Кодекса (опора канона)]\n' + selectedNotes.map((n, i) => `Запись #${i + 1} (${n.section} | ${n.title}):\n${n.content.trim()}`).join('\n\n'));
+            }
+            if (state.wizCustomPrompt.trim()) sourceBlocks.push(`[Запрос автора / Тема и сеттинг Лорбука]\n${state.wizCustomPrompt.trim()}`);
         }
-        if (state.wizUsePersona) { const pd = getUserPersonaDescriptionText(); if (pd) sourceBlocks.push(pd); }
-        if (state.wizUseChat) { const ct = buildChatContextSnippet(state.wizChatCount); if (ct) sourceBlocks.push(ct); }
-        if (state.wizUploadedDocs.length > 0) {
-            sourceBlocks.push('[Документы]\n' + state.wizUploadedDocs.map(d => `--- ${d.name} ---\n${d.text.slice(0, 14000)}`).join('\n\n'));
-        }
-        if (selectedNotes.length > 0) {
-            sourceBlocks.push('[Исходные заметки из Кодекса (опора канона)]\n' + selectedNotes.map((n, i) => `Запись #${i + 1} (${n.section} | ${n.title}):\n${n.content}`).join('\n\n'));
-        }
-        if (state.wizCustomPrompt.trim()) sourceBlocks.push(`[Запрос автора / Тема и сеттинг Лорбука]\n${state.wizCustomPrompt.trim()}`);
 
         const preset = getActiveForgeBookPreset();
         const rawBookTemplate = (s.forgeBookSystemPrompt && s.forgeBookSystemPrompt.trim())
@@ -609,58 +914,117 @@ export function createForgeController(deps) {
         const wordLim = buildWordLimitPhrase(s.forgeWordsMin, s.forgeWordsMax);
         const entryCntPhrase = buildEntryCountPhrase(s.forgeEntryCount, s.uiLang || 'ru');
 
+        const verbatimItems = [
+            ...selectedNotes.map(n => ({ title: n.title || n.section, rawContent: n.content })),
+            ...state.wizUploadedDocs.map(d => ({ title: d.name.replace(/\.[^.]+$/, ''), rawContent: d.text })),
+        ];
+
         const sysPrompt = state.wizMode === 'verbatim_keys'
-            ? `Ты — архивариус Лорбуков. НЕ ПЕРЕПИСЫВАЙ и НЕ СОКРАЩАЙ авторский текст записей Кодекса! Перенеси поле "content" каждой записи ДОСЛОВНО буква в букву, сохраняя все абзацы. Дай короткое имя в "comment", подбери 4–7 точных ключевых слов-триггеров в "keys" на языке "${lang}", укажи "constant" (false для лора/мест/деталей, true только для вечных правил) и "position" (0 = до чара, 1 = после чара, 4 = глубина чата с "depth": 4). Верни строго JSON { "entries": [...] }.`
+            ? `Ты — архивариус Лорбуков. Для каждого пронумерованного фрагмента придумай ТОЛЬКО метаданные (сам текст возвращать НЕ НУЖНО — он сохранится у автора дословно без изменений): короткое название в "comment", массив из 4–7 точных ключевых слов в "keys" на языке "${lang}", флаг "constant" (false для лора/мест/деталей, true только для глобальных правил), "position" (0 = до чара, 1 = после чара, 4 = глубина чата) и "depth" (число >= 0, например 4). Верни строго JSON: { "items": [ { "index": 0, "comment": "...", "keys": ["..."], "constant": false, "position": 1, "depth": 4 } ] }.`
             : rawBookTemplate
                 .replace(/\{\{lang\}\}/gi, lang)
                 .replace(/\{\{word_limit\}\}/gi, wordLim)
                 .replace(/\{\{entry_count\}\}/gi, entryCntPhrase);
 
-        return { sysPrompt, userPrompt: sourceBlocks.join('\n\n'), selectedNotes };
+        const userPrompt = state.wizMode === 'verbatim_keys'
+            ? verbatimItems.map((it, idx) => `[INDEX ${idx}] (${it.title}):\n${String(it.rawContent || '').slice(0, 6000)}`).join('\n\n---\n\n')
+            : sourceBlocks.join('\n\n');
+
+        return { sysPrompt, userPrompt, selectedNotes, verbatimItems };
     }
 
     async function executeAutoForge({ directCommit = false } = {}) {
-        const { sysPrompt, userPrompt, selectedNotes } = buildDynamicForgePrompts();
+        const s = ensureSettings();
+        const uiLang = s.uiLang || 'ru';
+        const { sysPrompt, userPrompt, verbatimItems } = buildDynamicForgePrompts();
 
         if (state.wizMode === 'direct_no_ai') {
-            if (selectedNotes.length === 0 && state.wizUploadedDocs.length === 0) {
-                state.wizStatus = 'Отметь разделы Кодекса в спойлере ниже или прикрепи файл.';
+            if (verbatimItems.length === 0) {
+                state.wizStatus = tUi(uiLang, 'Отметь разделы Кодекса в спойлере ниже или прикрепи файл.', 'Select Codex sections below or attach a text file.');
                 requestRender(); return;
             }
-            state.stagedEntries = [
-                ...selectedNotes.map(n => ({ included: true, comment: n.title || n.section, keys: n.title || n.section, content: formatCleanParagraphs(n.content), constant: false, vectorized: false, position: 1, depth: 4, role: 0 })),
-                ...state.wizUploadedDocs.map(d => ({ included: true, comment: d.name.replace(/\.[^.]+$/, ''), keys: d.name.replace(/\.[^.]+$/, ''), content: formatCleanParagraphs(d.text), constant: false, vectorized: false, position: 1, depth: 4, role: 0 })),
-            ];
+            // Preserve exact original text without forced mutation!
+            state.stagedEntries = verbatimItems.map(it => ({
+                included: true,
+                comment: it.title,
+                keys: it.title,
+                content: String(it.rawContent || ''),
+                constant: false, vectorized: false, position: 1, depth: 4, role: 0,
+            }));
             state.stagedCollapsed = {};
-            state.targetBookName = state.targetBookName || ('Лорбук ' + (stApi.ctx.name2 || 'Истории'));
+            state.targetBookName = state.targetBookName || ('Lorebook_' + (stApi.ctx.name2 || 'Story'));
             if (directCommit) { await commitApprovedLorebook(); return; }
             state.screen = 'approve'; state.wizStatus = ''; requestRender(); return;
         }
 
-        if (!userPrompt.trim()) {
-            state.wizStatus = 'Напиши тему/сеттинг выше или открой чат персонажа.';
+        if (state.wizMode === 'verbatim_keys' && verbatimItems.length === 0) {
+            state.wizStatus = tUi(uiLang, 'Для дословного переноса отметь хотя бы один раздел Кодекса с записями или прикрепи файл.', 'Select at least one Codex section with notes or attach a file for verbatim mode.');
             requestRender(); return;
         }
 
-        state.wizForging = true;
-        state.wizStatus = directCommit ? 'Куём и сразу сохраняем готовый Лорбук...' : 'Кузница собирает черновик страниц...';
-        requestRender();
-        try {
-            const rawResp = await callForgeModel(sysPrompt, userPrompt, FORGE_JSON_SCHEMA, 4400);
-            const obj = parseJsonObjectFromModel(rawResp);
-            const parsedEntries = Array.isArray(rawResp?.entries) ? rawResp.entries : (Array.isArray(obj?.entries) ? obj.entries : null);
-            if (!parsedEntries || parsedEntries.length === 0) throw new Error('Модель не вернула список страниц.');
+        if (!userPrompt.trim()) {
+            state.wizStatus = tUi(uiLang, 'Напиши тему/сеттинг выше или выбери источники.', 'Enter a theme/setting above or select source notes.');
+            requestRender(); return;
+        }
 
-            state.stagedEntries = parsedEntries.map(e => ({
-                included: true, comment: String(e.comment || 'Статья лора').trim(),
-                keys: Array.isArray(e.keys) ? e.keys.join(', ') : String(e.keys || ''),
-                content: formatCleanParagraphs(e.content || ''),
-                constant: Boolean(e.constant), vectorized: false,
-                position: [0, 1, 4].includes(Number(e.position)) ? Number(e.position) : 1,
-                depth: Math.max(0, Number(e.depth) || 4), role: 0,
-            }));
+        const reqSeq = ++forgeAiSeq;
+        const chatAtStart = stApi.ctx?.getCurrentChatId?.() || stApi.ctx?.chatId || '';
+        state.wizForging = true;
+        state.wizStatus = directCommit
+            ? tUi(uiLang, 'Куём и сохраняем готовый Лорбук...', 'Forging and saving Lorebook...')
+            : tUi(uiLang, 'Кузница собирает черновик страниц...', 'Forging draft pages...');
+        requestRender();
+
+        try {
+            if (state.wizMode === 'verbatim_keys') {
+                const rawResp = await callForgeModel(sysPrompt, userPrompt, VERBATIM_META_JSON_SCHEMA, 3200);
+                if (reqSeq !== forgeAiSeq || (stApi.ctx?.getCurrentChatId?.() || stApi.ctx?.chatId || '') !== chatAtStart) return;
+                const obj = parseJsonObjectFromModel(rawResp, 'verbatim_keys');
+                const metaItems = Array.isArray(obj?.items) ? obj.items : [];
+                if (!metaItems.length) throw new Error(tUi(uiLang, 'Модель не вернула ключи для записей.', 'Model did not return metadata items.'));
+                const metaByIdx = new Map(metaItems.map((m, idx) => [Number.isInteger(Number(m?.index)) ? Number(m.index) : idx, m]));
+
+                state.stagedEntries = verbatimItems.map((orig, idx) => {
+                    const m = metaByIdx.get(idx) || {};
+                    const parsedKeys = parseSmartTriggerKeys(m.keys);
+                    return {
+                        included: true,
+                        comment: String(m.comment || orig.title || 'Статья лора').trim(),
+                        keys: parsedKeys.length ? parsedKeys.join(', ') : orig.title,
+                        // 100% untouched original text — AI cannot rewrite a single character!
+                        content: String(orig.rawContent || ''),
+                        constant: Boolean(m.constant),
+                        vectorized: false,
+                        position: parseSafePosition(m.position, 1),
+                        depth: parseSafeDepth(m.depth, 4),
+                        role: 0,
+                    };
+                });
+            } else {
+                const estMaxTokens = Math.min(8192, Math.max(4400, (Number(s.forgeEntryCount) || 5) * 450));
+                const rawResp = await callForgeModel(sysPrompt, userPrompt, FORGE_JSON_SCHEMA, estMaxTokens);
+                if (reqSeq !== forgeAiSeq || (stApi.ctx?.getCurrentChatId?.() || stApi.ctx?.chatId || '') !== chatAtStart) return;
+                const obj = parseJsonObjectFromModel(rawResp, 'book');
+                const parsedEntries = Array.isArray(obj?.entries) ? obj.entries : null;
+                if (!parsedEntries || parsedEntries.length === 0) {
+                    throw new Error(tUi(uiLang, 'Модель не вернула список страниц.', 'Model did not return an entries list.'));
+                }
+
+                state.stagedEntries = parsedEntries.map(e => ({
+                    included: true,
+                    comment: String(e.comment || 'Статья лора').trim(),
+                    keys: parseSmartTriggerKeys(e.keys).join(', '),
+                    content: formatCleanParagraphs(e.content || ''),
+                    constant: Boolean(e.constant),
+                    vectorized: false,
+                    position: parseSafePosition(e.position, 1),
+                    depth: parseSafeDepth(e.depth, 4),
+                    role: 0,
+                }));
+            }
+
             state.stagedCollapsed = {};
-            state.targetBookName = state.targetBookName || ('Лорбук ' + (stApi.ctx.name2 || 'Мира'));
+            state.targetBookName = state.targetBookName || ('Lorebook_' + (stApi.ctx.name2 || 'World'));
             state.wizStatus = '';
             if (directCommit) {
                 await commitApprovedLorebook();
@@ -668,56 +1032,98 @@ export function createForgeController(deps) {
             }
             state.screen = 'approve';
         } catch (err) {
-            state.wizStatus = 'Ошибка: ' + (err?.message || String(err));
+            if (reqSeq === forgeAiSeq) {
+                state.wizStatus = 'Ошибка: ' + (err?.message || String(err));
+            }
         } finally {
-            state.wizForging = false; requestRender();
+            if (reqSeq === forgeAiSeq) {
+                state.wizForging = false;
+                requestRender();
+            }
         }
     }
 
     async function commitApprovedLorebook() {
-        const chosenItems = state.stagedEntries.filter(e => e.included && e.content.trim());
+        const uiLang = ensureSettings().uiLang || 'ru';
+        const chosenItems = state.stagedEntries.filter(e => e.included && String(e.content || '').trim());
         if (chosenItems.length === 0) return;
 
-        let fileId = '', bookData = { entries: {}, extensions: {} };
-        if (state.targetBookMode === 'existing' && state.targetExistingId) {
-            fileId = state.targetExistingId;
-            bookData = await loadBookData(fileId);
-        } else {
-            const rawName = (state.targetBookName || '').trim() || ('Лорбук_' + (stApi.ctx.name2 || 'Мира'));
-            fileId = rawName.replace(/[<>:"/\\|?*]/g, '_');
+        try {
+            let fileId = '';
+            if (state.targetBookMode === 'existing' && state.targetExistingId) {
+                fileId = state.targetExistingId;
+            } else {
+                const rawName = (state.targetBookName || '').trim() || ('Lorebook_' + (stApi.ctx.name2 || 'World'));
+                const sanitized = rawName.replace(/[<>:"/\\|?*]/g, '_');
+                // Strict list check — throws and aborts if /api/worldinfo/list fails (e.g. HTTP 503)!
+                const liveList = await fetchBooksList({ strict: true });
+                const matched = liveList.find(b => String(b.file_id).toLowerCase() === sanitized.toLowerCase());
+                if (matched) {
+                    const mergeOk = window.confirm(tUi(
+                        uiLang,
+                        `Лорбук «${matched.file_id}» уже существует! Дописать новые страницы в конец книги «${matched.file_id}» (ОК) или отменить (Отмена)?`,
+                        `Lorebook "${matched.file_id}" already exists! Append new pages to "${matched.file_id}" (OK) or cancel (Cancel)?`,
+                    ));
+                    if (!mergeOk) return;
+                    fileId = matched.file_id;
+                } else {
+                    fileId = sanitized;
+                }
+            }
+
+            const existingCheck = state.books.some(b => b.file_id === fileId) || (state.targetBookMode === 'existing');
+            const wiTpl = stApi.worldInfoMod?.newWorldInfoEntryTemplate;
+            let savedData = null;
+
+            if (existingCheck) {
+                savedData = await mutateBookAtomically(fileId, (workingCopy) => {
+                    if (state.targetCover) {
+                        workingCopy.extensions = workingCopy.extensions || {};
+                        workingCopy.extensions.pocket_codex_cover = state.targetCover;
+                    }
+                    const uids = Object.keys(workingCopy.entries).map(Number).filter(n => !Number.isNaN(n));
+                    let nextUid = uids.length > 0 ? (Math.max(...uids) + 1) : 0;
+                    for (const item of chosenItems) {
+                        workingCopy.entries[String(nextUid)] = makeStandardWiEntry(nextUid, item, wiTpl);
+                        nextUid++;
+                    }
+                });
+            } else {
+                const workingCopy = { entries: {}, extensions: {} };
+                if (state.targetCover) {
+                    workingCopy.extensions.pocket_codex_cover = state.targetCover;
+                }
+                let nextUid = 0;
+                for (const item of chosenItems) {
+                    workingCopy.entries[String(nextUid)] = makeStandardWiEntry(nextUid, item, wiTpl);
+                    nextUid++;
+                }
+                savedData = await enqueueBookWrite(fileId, () => saveBookData(fileId, workingCopy));
+            }
+            await applyBindingScope(fileId, state.bindAfterScope);
+
+            const exportedCatIds = Object.keys(state.wizSelectedCats).filter(k => state.wizSelectedCats[k]);
+            if (state.wizMuteExportedCats && exportedCatIds.length > 0) {
+                const store = getActiveStore();
+                for (const cid of exportedCatIds) {
+                    const c = store.categories.find(x => x.id === cid);
+                    if (c) c.enabled = false;
+                }
+                saveAllCodex();
+            }
+
+            state.wizUploadedDocs = [];
+            state.stagedEntries = [];
             await fetchBooksList();
-            const existsAlready = state.books.some(b => String(b.file_id).toLowerCase() === fileId.toLowerCase());
-            if (existsAlready) {
-                const mergeOk = window.confirm(`Лорбук «${fileId}» уже существует! Добавить новые страницы в конец существующей книги (ОК) или отменить сохранение (Отмена)?`);
-                if (!mergeOk) return;
-                bookData = await loadBookData(fileId);
-            }
+            state.activeBookId = fileId;
+            state.activeBookData = savedData;
+            state.screen = 'book_entries';
+            requestRender();
+        } catch (err) {
+            state.wizStatus = 'Ошибка сохранения: ' + (err?.message || String(err));
+            window.alert(state.wizStatus);
+            requestRender();
         }
-        if (state.targetCover) {
-            bookData.extensions = bookData.extensions || {};
-            bookData.extensions.pocket_codex_cover = state.targetCover;
-        }
-        const uids = Object.keys(bookData.entries).map(Number).filter(n => !Number.isNaN(n));
-        let nextUid = uids.length > 0 ? (Math.max(...uids) + 1) : 0;
-        for (const item of chosenItems) {
-            bookData.entries[String(nextUid)] = makeStandardWiEntry(nextUid, item);
-            nextUid++;
-        }
-        await saveBookData(fileId, bookData);
-        await applyBindingScope(fileId, state.bindAfterScope);
-
-        const exportedCatIds = Object.keys(state.wizSelectedCats).filter(k => state.wizSelectedCats[k]);
-        if (state.wizMuteExportedCats && exportedCatIds.length > 0) {
-            const store = getActiveStore();
-            for (const c of store.categories) {
-                if (exportedCatIds.includes(c.id)) c.enabled = false;
-            }
-            if (typeof saveAllCodex === 'function') saveAllCodex();
-        }
-
-        await fetchBooksList();
-        state.activeBookId = fileId; state.activeBookData = bookData; state.screen = 'book_entries';
-        requestRender();
     }
 
     function renderForgeBody() {
@@ -945,9 +1351,10 @@ export function createForgeController(deps) {
                                     <div><label class="pcx-field-label">Ключевые слова (через запятую)</label><input class="pcx-input pcx-st-keys" data-idx="${idx}" value="${escapeHtml(st.keys)}"></div>
                                     <div class="pcx-row-3">
                                         <div><label class="pcx-field-label">Активация</label><select class="pcx-select pcx-st-trig" data-idx="${idx}"><option value="keys" ${(!st.constant && !st.vectorized) ? 'selected' : ''}>По ключам</option><option value="const" ${st.constant ? 'selected' : ''}>Постоянно</option><option value="vec" ${st.vectorized ? 'selected' : ''}>Вектор</option></select></div>
-                                        <div><label class="pcx-field-label">Позиция</label><select class="pcx-select pcx-st-pos" data-idx="${idx}"><option value="0" ${Number(st.position) === 0 ? 'selected' : ''}>До чара</option><option value="1" ${Number(st.position) === 1 ? 'selected' : ''}>После чара</option><option value="4" ${Number(st.position) === 4 ? 'selected' : ''}>Глубина</option></select></div>
-                                        <div><label class="pcx-field-label">${Number(st.position) === 4 ? 'Глубина' : 'Роль'}</label>${Number(st.position) === 4 ? `<input type="number" min="0" max="999" class="pcx-input pcx-st-depth" data-idx="${idx}" value="${Number(st.depth) || 4}">` : `<select class="pcx-select pcx-st-role" data-idx="${idx}"><option value="0" ${Number(st.role) === 0 ? 'selected' : ''}>System</option><option value="1" ${Number(st.role) === 1 ? 'selected' : ''}>User</option><option value="2" ${Number(st.role) === 2 ? 'selected' : ''}>Assistant</option></select>`}</div>
+                                        <div><label class="pcx-field-label">Позиция</label><select class="pcx-select pcx-st-pos" data-idx="${idx}">${renderPositionOptions(st.position, uiLang)}</select></div>
+                                        <div><label class="pcx-field-label">${Number(st.position) === 4 ? 'Глубина' : 'Роль'}</label>${Number(st.position) === 4 ? `<input type="number" min="0" max="999" class="pcx-input pcx-st-depth" data-idx="${idx}" value="${parseSafeDepth(st.depth, 4)}">` : `<select class="pcx-select pcx-st-role" data-idx="${idx}"><option value="0" ${Number(st.role) === 0 ? 'selected' : ''}>System</option><option value="1" ${Number(st.role) === 1 ? 'selected' : ''}>User</option><option value="2" ${Number(st.role) === 2 ? 'selected' : ''}>Assistant</option></select>`}</div>
                                     </div>
+                                    ${Number(st.position) === 7 ? `<div><label class="pcx-field-label">${tUi(uiLang, 'Имя шлюза Outlet (для макроса {{outlet::Имя}})', 'Outlet Name (for {{outlet::Name}})')}</label><input class="pcx-input pcx-st-outlet" data-idx="${idx}" placeholder="LoreOutlet" value="${escapeHtml(st.outletName || '')}"></div>` : ''}
                                     <textarea class="pcx-textarea pcx-st-content" data-idx="${idx}" style="min-height:85px">${escapeHtml(st.content)}</textarea>
                                 ` : ''}
                             </div>`;
@@ -998,6 +1405,7 @@ export function createForgeController(deps) {
                             </select>
                         </div>` : ''}
 
+                    ${state.saveError ? `<div class="pcx-err-banner"><span>${escapeHtml(state.saveError)}</span></div>` : ''}
                     <div class="pcx-mode-tabs">
                         <button type="button" class="pcx-mode-tab ${state.entryEditTab === 'manual' ? 'pcx-active' : ''}" data-fgetab="manual">${ICONS.edit}<span>${tUi(uiLang, 'Вручную', 'Manual')}</span></button>
                         <button type="button" class="pcx-mode-tab ${state.entryEditTab === 'ai' ? 'pcx-active' : ''}" data-fgetab="ai">${ICONS.spark}<span>${tUi(uiLang, 'С Соавтором (ИИ)', 'AI Co-Author')}</span></button>
@@ -1078,14 +1486,15 @@ export function createForgeController(deps) {
                                     ${state.keysGenerating ? ICONS.spinner : ICONS.key}<span>${state.keysGenerating ? 'Подбор...' : 'Подобрать ключи ИИ'}</span>
                                 </button>
                             </div>
-                            <input id="pcx-fge-keys" class="pcx-input" placeholder="компас, таверн, март, порт" value="${escapeHtml(Array.isArray(d.key) ? d.key.join(', ') : d.key)}">
+                            <input id="pcx-fge-keys" class="pcx-input" placeholder="compass, tavern, /\\brelic{1,2}\\b/i" value="${escapeHtml(state.entryKeysDirty ? state.entryKeysRawText : (Array.isArray(d.key) ? d.key.join(', ') : (d.key || '')))}">
                         </div>
                         <div class="pcx-row-2">
                             <div><label class="pcx-field-label">Активация ${renderHelpBtn('forge_trig')}</label><select id="pcx-fge-trig" class="pcx-select"><option value="keys" ${trigMode === 'keys' ? 'selected' : ''}>По ключам в чате</option><option value="const" ${trigMode === 'const' ? 'selected' : ''}>Постоянно</option><option value="vec" ${trigMode === 'vec' ? 'selected' : ''}>Векторизация</option></select></div>
-                            <div><label class="pcx-field-label">Позиция</label><select id="pcx-fge-pos" class="pcx-select"><option value="0" ${pos === 0 ? 'selected' : ''}>До описания чара</option><option value="1" ${pos === 1 ? 'selected' : ''}>После описания чара</option><option value="4" ${pos === 4 ? 'selected' : ''}>В глубине чата</option></select></div>
+                            <div><label class="pcx-field-label">${tUi(uiLang, 'Позиция', 'Position')}</label><select id="pcx-fge-pos" class="pcx-select">${renderPositionOptions(pos, uiLang)}</select></div>
                         </div>
                         ${renderHelpBubble('forge_trig')}
-                        ${pos === 4 ? `<div class="pcx-row-2"><div><label class="pcx-field-label">Глубина (0 = низ)</label><input id="pcx-fge-depth" type="number" min="0" max="999" class="pcx-input" value="${Math.max(0, Number(d.depth) || 0)}"></div><div><label class="pcx-field-label">Роль</label><select id="pcx-fge-role" class="pcx-select"><option value="0" ${Number(d.role) === 0 ? 'selected' : ''}>System</option><option value="1" ${Number(d.role) === 1 ? 'selected' : ''}>User</option><option value="2" ${Number(d.role) === 2 ? 'selected' : ''}>Assistant</option></select></div></div>` : ''}
+                        ${pos === 4 ? `<div class="pcx-row-2"><div><label class="pcx-field-label">Глубина (0 = низ)</label><input id="pcx-fge-depth" type="number" min="0" max="999" class="pcx-input" value="${parseSafeDepth(d.depth, 0)}"></div><div><label class="pcx-field-label">Роль</label><select id="pcx-fge-role" class="pcx-select"><option value="0" ${Number(d.role) === 0 ? 'selected' : ''}>System</option><option value="1" ${Number(d.role) === 1 ? 'selected' : ''}>User</option><option value="2" ${Number(d.role) === 2 ? 'selected' : ''}>Assistant</option></select></div></div>` : ''}
+                        ${pos === 7 ? `<div><label class="pcx-field-label">${tUi(uiLang, 'Имя шлюза Outlet (для макроса {{outlet::Имя}})', 'Outlet Name (for {{outlet::Name}})')}</label><input id="pcx-fge-outlet" class="pcx-input" placeholder="LoreOutlet" value="${escapeHtml(d.outletName || '')}"></div>` : ''}
                         <div>
                             <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;margin-bottom:5px;flex-wrap:wrap;">
                                 <label class="pcx-field-label" style="margin:0">Содержание страницы</label>
@@ -1120,10 +1529,7 @@ export function createForgeController(deps) {
             const colMap = getBookCollapsedMap(state.activeBookId);
             const allCollapsed = list.length > 0 && list.every(e => Boolean(colMap[e.uid]));
 
-            const recReport = analyzeBookRecursion(
-                state.activeBookData.entries,
-                [stApi.ctx?.name1, stApi.ctx?.name2].filter(Boolean),
-            );
+            const recReport = getCachedRecursionReport(state.activeBookData.entries);
             const loopUidSet = new Set(recReport.loops.flatMap(l => l.uids.map(String)));
             const recBadgeText = recReport.loops.length > 0
                 ? `${tUi(uiLang, 'Петель', 'Loops')}: ${recReport.loops.length}`
@@ -1176,10 +1582,51 @@ export function createForgeController(deps) {
                     ${!isAnyBound ? `<div style="font-size:11px;color:var(--pcx-accent-2);">${tUi(uiLang, 'Книга сейчас выключена — нажми «Глобально», «В чат» или «Персонаж» выше.', 'This Lorebook is currently off — toggle Global, Chat, or Char above.')}</div>` : ''}
                 </div>
 
+                ${state.saveError ? `<div class="pcx-err-banner"><span>${escapeHtml(state.saveError)}</span></div>` : ''}
+                ${state.lastDeletedEntry && state.lastDeletedEntry.bookId === state.activeBookId ? `
+                    <div class="pcx-undo-bar">
+                        <span>${tUi(uiLang, 'Страница удалена:', 'Page deleted:')} <b>${escapeHtml(state.lastDeletedEntry.entry.comment || ('#' + state.lastDeletedEntry.uid))}</b></span>
+                        <button type="button" class="pcx-mini-btn" id="pcx-fg-undo-del">${ICONS.undo}<span>${tUi(uiLang, 'Вернуть', 'Undo')}</span></button>
+                    </div>` : ''}
+                ${list.length > 0 ? `
+                    <div class="pcx-search-bar">
+                        <div class="pcx-search-wrap">
+                            <span class="pcx-search-icon">${ICONS.search}</span>
+                            <input type="text" id="pcx-fg-entry-search" class="pcx-search-input" placeholder="${tUi(uiLang, 'Поиск по названию, ключам и тексту...', 'Search title, trigger keys, or text...')}" value="${escapeHtml(state.entryQuery)}">
+                            ${state.entryQuery ? `<button type="button" class="pcx-search-clear" id="pcx-fg-entry-search-clear">${ICONS.close}</button>` : ''}
+                        </div>
+                        <div class="pcx-filter-strip">
+                            ${[
+                                ['all', tUi(uiLang, 'Все', 'All')],
+                                ['on', tUi(uiLang, 'Вкл', 'Active')],
+                                ['off', tUi(uiLang, 'Выкл', 'Muted')],
+                                ['live', tUi(uiLang, 'В чате / промпте', 'Triggered')],
+                                ['const', tUi(uiLang, 'Постоянные', 'Constant')],
+                                ['nokeys', tUi(uiLang, 'Без ключей', 'No Keys')],
+                            ].map(([fid, flabel]) => `<button type="button" class="pcx-filter-chip ${state.entryFilter === fid ? 'pcx-active' : ''}" data-fg-efilter="${fid}">${flabel}</button>`).join('')}
+                        </div>
+                    </div>` : ''}
                 ${subbarHtml}
                 ${recursionPanelHtml}
 
-                ${list.length === 0 ? `<div class="pcx-empty">${tUi(uiLang, 'В книге пока нет страниц.<br>Нажми <b>«+ Страница с ИИ»</b> или <b>«+ Вручную»</b>!', 'No pages in this Lorebook yet.<br>Tap <b>+ AI Page</b> or <b>+ Manual</b>!')}</div>` : list.map(ent => {
+                ${(() => {
+                    const q = state.entryQuery.trim().toLowerCase();
+                    const filteredList = list.filter(ent => {
+                        if (state.entryFilter === 'on' && ent.disable) return false;
+                        if (state.entryFilter === 'off' && !ent.disable) return false;
+                        if (state.entryFilter === 'const' && !ent.constant) return false;
+                        if (state.entryFilter === 'nokeys' && (ent.constant || (Array.isArray(ent.key) && ent.key.some(k => String(k).trim())))) return false;
+                        if (state.entryFilter === 'live' && !scanEntryAgainstRecentChat(ent, state.activeBookId).live) return false;
+                        if (!q) return true;
+                        const hay = `${ent.comment || ''} \n ${(ent.key || []).join(' ')} \n ${(ent.keysecondary || []).join(' ')} \n ${ent.content || ''}`.toLowerCase();
+                        return hay.includes(q);
+                    });
+                    if (list.length === 0) return true;
+                    if (filteredList.length === 0) return 'NO_MATCH';
+                    list.length = 0;
+                    list.push(...filteredList);
+                    return false;
+                })() === 'NO_MATCH' ? `<div class="pcx-empty">${tUi(uiLang, 'По текущему фильтру или запросу страниц не найдено.', 'No pages match your current search or filter.')}</div>` : list.length === 0 ? `<div class="pcx-empty">${tUi(uiLang, 'В книге пока нет страниц.<br>Нажми <b>«+ Страница с ИИ»</b> или <b>«+ Вручную»</b>!', 'No pages in this Lorebook yet.<br>Tap <b>+ AI Page</b> or <b>+ Manual</b>!')}</div>` : list.map(ent => {
                     const isOn = !ent.disable;
                     const isCol = Boolean(colMap[ent.uid]);
                     const modeTag = ent.constant ? tUi(uiLang, 'Постоянно', 'Constant') : (ent.vectorized ? tUi(uiLang, 'Вектор', 'Vector') : tUi(uiLang, 'По ключам', 'Keywords'));
@@ -1198,6 +1645,7 @@ export function createForgeController(deps) {
                                     <div class="pcx-card-title" data-fg-collapse="${safeUid}">${escapeHtml(ent.comment || (tUi(uiLang, 'Страница #', 'Page #') + String(ent.uid)))}</div>
                                 </div>
                                 <div style="display:flex;align-items:center;gap:5px;flex-shrink:0;">
+                                    ${ent.stmemorybooks === true ? `<span class="pcx-prio-badge">Memory</span>` : ''}
                                     ${hasLoop ? `<span class="pcx-prio-badge" style="color:#ff5c77">${tUi(uiLang, 'Петля', 'Loop')}</span>` : ''}
                                     ${ent.preventRecursion ? `<span class="pcx-prio-badge">${tUi(uiLang, 'Без каскада', 'Isolated')}</span>` : ''}
                                     ${isCol && keysArr.length > 0 ? `<span class="pcx-prio-badge">${keysArr.length} ${tUi(uiLang, 'кл.', 'keys')}</span>` : ''}
@@ -1232,6 +1680,15 @@ export function createForgeController(deps) {
             return String(a.name || a.file_id).localeCompare(String(b.name || b.file_id));
         });
 
+        const shelfQ = state.shelfQuery.trim().toLowerCase();
+        const visibleBooks = sortedBooks.filter(b => {
+            const isBound = globalList.includes(b.file_id) || chatBoundList.includes(b.file_id) || charBound === b.file_id;
+            if (state.shelfFilter === 'bound' && !isBound) return false;
+            if (state.shelfFilter === 'unbound' && isBound) return false;
+            if (!shelfQ) return true;
+            return String(b.name || b.file_id).toLowerCase().includes(shelfQ);
+        });
+
         return `
             <div class="pcx-forge-toolbar">
                 <div class="pcx-forge-toprow">
@@ -1242,12 +1699,29 @@ export function createForgeController(deps) {
                     </div>
                 </div>
                 ${renderHelpBubble('forge_shelf')}
+                ${state.books.length > 1 ? `
+                    <div class="pcx-search-bar" style="margin-top:6px;">
+                        <div class="pcx-search-wrap">
+                            <span class="pcx-search-icon">${ICONS.search}</span>
+                            <input type="text" id="pcx-fg-shelf-search" class="pcx-search-input" placeholder="${tUi(uiLang, 'Быстрый фильтр книг по названию...', 'Filter Lorebooks by title...')}" value="${escapeHtml(state.shelfQuery)}">
+                            ${state.shelfQuery ? `<button type="button" class="pcx-search-clear" id="pcx-fg-shelf-search-clear">${ICONS.close}</button>` : ''}
+                        </div>
+                        <div class="pcx-filter-strip">
+                            ${[
+                                ['all', tUi(uiLang, 'Все книги', 'All Books')],
+                                ['bound', tUi(uiLang, 'Подключённые', 'Active / Bound')],
+                                ['unbound', tUi(uiLang, 'На полке (выкл)', 'Unbound')],
+                            ].map(([fid, flabel]) => `<button type="button" class="pcx-filter-chip ${state.shelfFilter === fid ? 'pcx-active' : ''}" data-fg-sfilter="${fid}">${flabel}</button>`).join('')}
+                        </div>
+                    </div>` : ''}
             </div>
 
-            ${state.loading ? `<div class="pcx-empty">${tUi(uiLang, 'Открываем архивы Лорбуков Таверны...', 'Loading Lorebooks...')}</div>` : (
+            ${state.loading && state.books.length === 0 ? `<div class="pcx-empty">${tUi(uiLang, 'Открываем архивы Лорбуков Таверны...', 'Loading Lorebooks...')}</div>` : (
                 sortedBooks.length === 0
                     ? `<div class="pcx-empty">${tUi(uiLang, 'На полке пока нет Лорбуков.<br>Нажми <b>«Создать / Выковать»</b>!', 'No Lorebooks yet.<br>Tap <b>Create / Forge</b>!')}</div>`
-                    : `<div class="pcx-book-grid">${sortedBooks.map(b => {
+                    : (visibleBooks.length === 0
+                        ? `<div class="pcx-empty">${tUi(uiLang, 'Книг по запросу не найдено.', 'No matching Lorebooks found.')}</div>`
+                        : `<div class="pcx-book-grid">${visibleBooks.map(b => {
                         const isGlob = globalList.includes(b.file_id);
                         const isChat = chatBoundList.includes(b.file_id);
                         const isChar = charBound === b.file_id;
@@ -1278,7 +1752,7 @@ export function createForgeController(deps) {
                                     <button type="button" class="pcx-mini-btn" data-fg-delbook="${escapeHtml(b.file_id)}" title="Удалить Лорбук">${ICONS.trash}</button>
                                 </div>
                             </div>`;
-                    }).join('')}</div><input type="file" id="pcx-fg-shelf-cover-in" accept="image/*" style="display:none">`
+                    }).join('')}</div><input type="file" id="pcx-fg-shelf-cover-in" accept="image/*" style="display:none">`)
             )}`;
     }
 
@@ -1294,6 +1768,7 @@ export function createForgeController(deps) {
         const d = state.entryDraft;
         const cEl = win.querySelector('#pcx-fge-comment');
         const kEl = win.querySelector('#pcx-fge-keys');
+        const outEl = win.querySelector('#pcx-fge-outlet');
         const tEl = win.querySelector('#pcx-fge-content');
         const taskEl = win.querySelector('#pcx-fgp-task');
         const refEl = win.querySelector('#pcx-fgc-refine');
@@ -1302,7 +1777,11 @@ export function createForgeController(deps) {
         const candT = win.querySelector('#pcx-fgc-content');
 
         if (cEl) d.comment = cEl.value;
-        if (kEl) d.key = kEl.value.split(',').map(k => k.trim()).filter(Boolean);
+        if (outEl) d.outletName = outEl.value;
+        if (kEl && state.entryKeysDirty) {
+            state.entryKeysRawText = kEl.value;
+            d.key = parseSmartTriggerKeys(kEl.value);
+        }
         if (tEl) d.content = tEl.value;
         if (taskEl) state.pageAiTask = taskEl.value;
         if (refEl) state.pageAiRefineText = refEl.value;
@@ -1321,16 +1800,17 @@ export function createForgeController(deps) {
         win.querySelector('#pcx-fg-back-shelf-2')?.addEventListener('click', goShelf);
 
         win.querySelector('#pcx-fg-open-hub-btn')?.addEventListener('click', () => { state.screen = 'create_hub'; requestRender(); });
+        const defaultSafeScope = () => (stApi.isChatOpen() ? 'chat' : 'none');
         win.querySelector('#pcx-fg-new-manual-btn')?.addEventListener('click', () => {
-            state.newBookName = ''; state.newBookCover = ''; state.newBookBindScope = 'global';
+            state.newBookName = ''; state.newBookCover = ''; state.newBookBindScope = defaultSafeScope();
             state.screen = 'new_book'; requestRender();
         });
 
         win.querySelector('#pcx-hub-whole-ai')?.addEventListener('click', () => {
-            state.wizMode = 'ai_adapt'; state.bindAfterScope = 'global'; state.screen = 'wizard'; requestRender();
+            state.wizMode = 'ai_adapt'; state.bindAfterScope = defaultSafeScope(); state.screen = 'wizard'; requestRender();
         });
         win.querySelector('#pcx-hub-whole-manual')?.addEventListener('click', () => {
-            state.newBookName = ''; state.newBookCover = ''; state.newBookBindScope = 'global';
+            state.newBookName = ''; state.newBookCover = ''; state.newBookBindScope = defaultSafeScope();
             state.screen = 'new_book'; requestRender();
         });
         win.querySelector('#pcx-hub-page-ai')?.addEventListener('click', () => {
@@ -1364,54 +1844,124 @@ export function createForgeController(deps) {
             const f = e.target.files?.[0]; if (!f) return;
             state.newBookCover = (await compressImageFile(f, 520, 0.82)).dataUrl; requestRender();
         });
+        win.querySelector('#pcx-fg-shelf-search')?.addEventListener('input', e => {
+            state.shelfQuery = e.target.value;
+            requestRender({ preserveBodyScroll: true });
+        });
+        win.querySelector('#pcx-fg-shelf-search-clear')?.addEventListener('click', () => {
+            state.shelfQuery = '';
+            requestRender({ preserveBodyScroll: true });
+        });
+        win.querySelectorAll('[data-fg-sfilter]').forEach(chip => chip.addEventListener('click', () => {
+            state.shelfFilter = chip.dataset.fgSfilter || 'all';
+            requestRender({ preserveBodyScroll: true });
+        }));
+
+        win.querySelector('#pcx-fg-entry-search')?.addEventListener('input', e => {
+            state.entryQuery = e.target.value;
+            requestRender({ preserveBodyScroll: true });
+        });
+        win.querySelector('#pcx-fg-entry-search-clear')?.addEventListener('click', () => {
+            state.entryQuery = '';
+            requestRender({ preserveBodyScroll: true });
+        });
+        win.querySelectorAll('[data-fg-efilter]').forEach(chip => chip.addEventListener('click', () => {
+            state.entryFilter = chip.dataset.fgEfilter || 'all';
+            requestRender({ preserveBodyScroll: true });
+        }));
+
+        win.querySelector('#pcx-fg-undo-del')?.addEventListener('click', async () => {
+            const last = state.lastDeletedEntry;
+            if (!last || !last.bookId || !last.entry) return;
+            try {
+                await mutateBookAtomically(last.bookId, (fresh) => {
+                    const desiredKey = String(last.uid);
+                    if (!fresh.entries[desiredKey]) {
+                        fresh.entries[desiredKey] = last.entry;
+                    } else {
+                        const uids = Object.keys(fresh.entries).map(Number).filter(n => !Number.isNaN(n));
+                        const safeUid = uids.length > 0 ? (Math.max(...uids) + 1) : 0;
+                        fresh.entries[String(safeUid)] = { ...last.entry, uid: safeUid };
+                    }
+                });
+                state.lastDeletedEntry = null;
+                requestRender({ preserveBodyScroll: true });
+            } catch (err) { window.alert(err?.message || String(err)); }
+        });
+
         win.querySelector('#pcx-fg-create-manual-confirm')?.addEventListener('click', async () => {
             const name = (state.newBookName || '').trim(); if (!name) return;
-            const fileId = name.replace(/[<>:"/\\|?*]/g, '_');
-            await fetchBooksList();
-            const existsAlready = state.books.some(b => String(b.file_id).toLowerCase() === fileId.toLowerCase());
-            if (existsAlready) {
-                const overwriteOk = window.confirm(`Лорбук «${fileId}» уже существует на полке! Открыть существующий том без стирания (ОК) или отменить (Отмена)?`);
-                if (!overwriteOk) return;
-                const existingData = await loadBookData(fileId);
-                if (state.newBookCover) {
-                    existingData.extensions = existingData.extensions || {};
-                    existingData.extensions.pocket_codex_cover = state.newBookCover;
-                    await saveBookData(fileId, existingData);
+            const uiLang = s.uiLang || 'ru';
+            const sanitized = name.replace(/[<>:"/\\|?*]/g, '_');
+            try {
+                // Strict check — halts if /api/worldinfo/list fails (503) so we never overwrite blindly!
+                const liveList = await fetchBooksList({ strict: true });
+                const matched = liveList.find(b => String(b.file_id).toLowerCase() === sanitized.toLowerCase());
+                if (matched) {
+                    const exactId = matched.file_id;
+                    const openOk = window.confirm(tUi(
+                        uiLang,
+                        `Лорбук «${exactId}» уже существует на полке! Открыть существующий том без стирания (ОК) или отменить (Отмена)?`,
+                        `Lorebook "${exactId}" already exists! Open the existing tome safely without erasing it (OK) or cancel (Cancel)?`,
+                    ));
+                    if (!openOk) return;
+                    let existingData = await loadBookData(exactId);
+                    if (state.newBookCover) {
+                        existingData = await mutateBookAtomically(exactId, (fresh) => {
+                            fresh.extensions = fresh.extensions || {};
+                            fresh.extensions.pocket_codex_cover = state.newBookCover;
+                        });
+                    }
+                    await applyBindingScope(exactId, state.newBookBindScope);
+                    state.activeBookId = exactId; state.activeBookData = existingData; state.screen = 'book_entries'; requestRender();
+                    return;
                 }
-                await applyBindingScope(fileId, state.newBookBindScope);
-                state.activeBookId = fileId; state.activeBookData = existingData; state.screen = 'book_entries'; requestRender();
-                return;
+                const data = { entries: {}, extensions: {} };
+                if (state.newBookCover) data.extensions.pocket_codex_cover = state.newBookCover;
+                const saved = await saveBookData(sanitized, data);
+                await applyBindingScope(sanitized, state.newBookBindScope);
+                await fetchBooksList();
+                state.activeBookId = sanitized; state.activeBookData = saved; state.screen = 'book_entries'; requestRender();
+            } catch (err) {
+                window.alert(tUi(uiLang, 'Не удалось проверить или создать Лорбук: ', 'Failed to verify or create Lorebook: ') + (err?.message || String(err)));
             }
-            const data = { entries: {}, extensions: {} };
-            if (state.newBookCover) data.extensions.pocket_codex_cover = state.newBookCover;
-            await saveBookData(fileId, data);
-            await applyBindingScope(fileId, state.newBookBindScope);
-            await fetchBooksList();
-            state.activeBookId = fileId; state.activeBookData = data; state.screen = 'book_entries'; requestRender();
         });
 
         win.querySelectorAll('[data-fg-open]').forEach(el => el.addEventListener('click', async () => {
-            state.activeBookId = el.dataset.fgOpen;
-            state.showRecursionPanel = false;
-            state.activeBookData = await loadBookData(state.activeBookId);
-            state.screen = 'book_entries'; requestRender();
+            const targetId = el.dataset.fgOpen;
+            if (!targetId) return;
+            try {
+                const loaded = await openBookAtomic(targetId);
+                if (!loaded) return; // Stale click superseded by a newer click!
+                state.showRecursionPanel = false;
+                state.entryQuery = '';
+                state.entryFilter = 'all';
+                state.screen = 'book_entries';
+                requestRender();
+            } catch (err) { window.alert(err?.message || String(err)); }
         }));
         win.querySelectorAll('[data-fg-quick-ai]').forEach(btn => btn.addEventListener('click', async () => {
             const bookId = btn.dataset.fgQuickAi;
-            state.activeBookId = bookId;
-            state.activeBookData = await loadBookData(bookId);
-            openEntryEditor({ bookId, uid: null, initialTab: 'ai' });
-            requestRender();
+            if (!bookId) return;
+            try {
+                const loaded = await openBookAtomic(bookId);
+                if (!loaded) return;
+                openEntryEditor({ bookId, uid: null, initialTab: 'ai', bookData: loaded });
+                requestRender();
+            } catch (err) { window.alert(err?.message || String(err)); }
         }));
         win.querySelectorAll('[data-fg-delbook]').forEach(btn => btn.addEventListener('click', async () => {
             const bookId = btn.dataset.fgDelbook;
-            if (!bookId || !window.confirm(`Удалить Лорбук «${bookId}» целиком?`)) return;
+            const uiLang = s.uiLang || 'ru';
+            if (!bookId || !window.confirm(tUi(uiLang, `Удалить Лорбук «${bookId}» целиком?`, `Delete Lorebook "${bookId}" permanently?`))) return;
             try {
+                // Delete file on server FIRST; only unbind if deletion actually succeeded!
+                await stApi.deleteWorldInfoBook(bookId);
                 if (getChatBoundBooks().includes(bookId)) await toggleBindBookToChat(bookId);
                 if ((stApi.getGlobalLorebooks?.() || []).includes(bookId)) await stApi.toggleGlobalLorebook?.(bookId);
                 if (stApi.getCharLorebook?.() === bookId) await stApi.toggleCharLorebook?.(bookId);
-                await stApi.deleteWorldInfoBook(bookId);
                 delete state.bookCounts[bookId];
+                if (state.activeBookId === bookId) { state.activeBookId = ''; state.activeBookData = null; }
                 await fetchBooksList();
                 requestRender({ preserveBodyScroll: true });
             } catch (err) { window.alert(err?.message || String(err)); }
@@ -1424,10 +1974,15 @@ export function createForgeController(deps) {
         }));
         win.querySelector('#pcx-fg-shelf-cover-in')?.addEventListener('change', async e => {
             const f = e.target.files?.[0]; if (!f || !coverTargetBookId) return;
-            const att = await compressImageFile(f, 520, 0.82);
-            const data = await loadBookData(coverTargetBookId);
-            data.extensions = data.extensions || {}; data.extensions.pocket_codex_cover = att.dataUrl;
-            await saveBookData(coverTargetBookId, data); await fetchBooksList(); requestRender({ preserveBodyScroll: true });
+            try {
+                const att = await compressImageFile(f, 520, 0.82);
+                await mutateBookAtomically(coverTargetBookId, (fresh) => {
+                    fresh.extensions = fresh.extensions || {};
+                    fresh.extensions.pocket_codex_cover = att.dataUrl;
+                });
+                await fetchBooksList();
+                requestRender({ preserveBodyScroll: true });
+            } catch (err) { window.alert(err?.message || String(err)); }
         });
 
         // Inside book: Collapse/Expand pages & Recursion Inspector (No Search)
@@ -1453,23 +2008,39 @@ export function createForgeController(deps) {
             requestRender({ preserveBodyScroll: true });
         });
         win.querySelector('#pcx-fg-break-loops')?.addEventListener('click', async () => {
-            if (!state.activeBookData) return;
-            const rep = analyzeBookRecursion(state.activeBookData.entries, [stApi.ctx?.name1, stApi.ctx?.name2].filter(Boolean));
-            for (const lp of rep.loops) {
-                for (const uid of lp.uids) {
-                    if (state.activeBookData.entries[uid]) state.activeBookData.entries[uid].preventRecursion = true;
-                }
-            }
-            await saveBookData(state.activeBookId, state.activeBookData);
-            requestRender({ preserveBodyScroll: true });
+            if (!state.activeBookData || !state.activeBookId) return;
+            const targetBook = state.activeBookId;
+            const rep = getCachedRecursionReport(state.activeBookData.entries);
+            if (!rep.loops.length) return;
+            const affectedTitles = [...new Set(rep.loops.flatMap(lp => lp.uids.map(u => state.activeBookData.entries[u]?.comment || ('#' + u))))];
+            const uiLang = s.uiLang || 'ru';
+            if (!window.confirm(tUi(
+                uiLang,
+                `Отключить каскад рекурсии у страниц в петлях (${affectedTitles.join(', ')})?`,
+                `Isolate recursion on loop entries (${affectedTitles.join(', ')})?`,
+            ))) return;
+            try {
+                await mutateBookAtomically(targetBook, (fresh) => {
+                    for (const lp of rep.loops) {
+                        for (const uid of lp.uids) {
+                            if (fresh.entries[uid]) fresh.entries[uid].preventRecursion = true;
+                        }
+                    }
+                });
+                requestRender({ preserveBodyScroll: true });
+            } catch (err) { window.alert(err?.message || String(err)); }
         });
         win.querySelector('#pcx-fg-toggle-all-rec')?.addEventListener('click', async () => {
-            if (!state.activeBookData) return;
-            const list = Object.values(state.activeBookData.entries || {});
-            const allIso = list.length > 0 && list.every(e => Boolean(e.preventRecursion));
-            for (const e of list) e.preventRecursion = !allIso;
-            await saveBookData(state.activeBookId, state.activeBookData);
-            requestRender({ preserveBodyScroll: true });
+            if (!state.activeBookData || !state.activeBookId) return;
+            const targetBook = state.activeBookId;
+            try {
+                await mutateBookAtomically(targetBook, (fresh) => {
+                    const list = Object.values(fresh.entries || {});
+                    const allIso = list.length > 0 && list.every(e => Boolean(e.preventRecursion));
+                    for (const e of list) e.preventRecursion = !allIso;
+                });
+                requestRender({ preserveBodyScroll: true });
+            } catch (err) { window.alert(err?.message || String(err)); }
         });
 
         win.querySelector('#pcx-fge-new-btn')?.addEventListener('click', () => {
@@ -1482,32 +2053,63 @@ export function createForgeController(deps) {
         });
 
         win.querySelectorAll('[data-fg-toggle]').forEach(sw => sw.addEventListener('click', async () => {
-            const ent = state.activeBookData?.entries?.[sw.dataset.fgToggle]; if (!ent) return;
-            ent.disable = !ent.disable; await saveBookData(state.activeBookId, state.activeBookData); requestRender({ preserveBodyScroll: true });
+            const uid = sw.dataset.fgToggle, bookId = state.activeBookId;
+            if (!bookId || !state.activeBookData?.entries?.[uid]) return;
+            try {
+                await mutateBookAtomically(bookId, (fresh) => {
+                    if (fresh.entries[uid]) fresh.entries[uid].disable = !fresh.entries[uid].disable;
+                });
+                requestRender({ preserveBodyScroll: true });
+            } catch (err) { window.alert(err?.message || String(err)); }
         }));
         win.querySelectorAll('[data-fg-norec]').forEach(btn => btn.addEventListener('click', async () => {
-            const ent = state.activeBookData?.entries?.[btn.dataset.fgNorec]; if (!ent) return;
-            ent.preventRecursion = !ent.preventRecursion;
-            await saveBookData(state.activeBookId, state.activeBookData); requestRender({ preserveBodyScroll: true });
+            const uid = btn.dataset.fgNorec, bookId = state.activeBookId;
+            if (!bookId || !state.activeBookData?.entries?.[uid]) return;
+            try {
+                await mutateBookAtomically(bookId, (fresh) => {
+                    if (fresh.entries[uid]) fresh.entries[uid].preventRecursion = !fresh.entries[uid].preventRecursion;
+                });
+                requestRender({ preserveBodyScroll: true });
+            } catch (err) { window.alert(err?.message || String(err)); }
         }));
         win.querySelectorAll('[data-fg-vec]').forEach(btn => btn.addEventListener('click', async () => {
-            const ent = state.activeBookData?.entries?.[btn.dataset.fgVec]; if (!ent) return;
-            ent.vectorized = !ent.vectorized; if (ent.vectorized) ent.constant = false;
-            await saveBookData(state.activeBookId, state.activeBookData); requestRender({ preserveBodyScroll: true });
+            const uid = btn.dataset.fgVec, bookId = state.activeBookId;
+            if (!bookId || !state.activeBookData?.entries?.[uid]) return;
+            try {
+                await mutateBookAtomically(bookId, (fresh) => {
+                    if (fresh.entries[uid]) {
+                        fresh.entries[uid].vectorized = !fresh.entries[uid].vectorized;
+                        if (fresh.entries[uid].vectorized) fresh.entries[uid].constant = false;
+                    }
+                });
+                requestRender({ preserveBodyScroll: true });
+            } catch (err) { window.alert(err?.message || String(err)); }
         }));
         win.querySelectorAll('[data-fg-edit]').forEach(btn => btn.addEventListener('click', () => {
             if (!state.activeBookData?.entries?.[btn.dataset.fgEdit]) return;
-            openEntryEditor({ bookId: state.activeBookId, uid: btn.dataset.fgEdit, initialTab: 'manual' });
+            openEntryEditor({ bookId: state.activeBookId, uid: btn.dataset.fgEdit, initialTab: 'manual', bookData: state.activeBookData });
             requestRender();
         }));
         win.querySelectorAll('[data-fg-ai-edit]').forEach(btn => btn.addEventListener('click', () => {
             if (!state.activeBookData?.entries?.[btn.dataset.fgAiEdit]) return;
-            openEntryEditor({ bookId: state.activeBookId, uid: btn.dataset.fgAiEdit, initialTab: 'ai' });
+            openEntryEditor({ bookId: state.activeBookId, uid: btn.dataset.fgAiEdit, initialTab: 'ai', bookData: state.activeBookData });
             requestRender();
         }));
         win.querySelectorAll('[data-fg-del]').forEach(btn => btn.addEventListener('click', async () => {
-            delete state.activeBookData.entries[btn.dataset.fgDel];
-            await saveBookData(state.activeBookId, state.activeBookData); requestRender({ preserveBodyScroll: true });
+            const uid = btn.dataset.fgDel, bookId = state.activeBookId;
+            const ent = state.activeBookData?.entries?.[uid];
+            if (!bookId || !ent) return;
+            const uiLang = s.uiLang || 'ru';
+            const title = ent.comment || ('#' + uid);
+            if (!window.confirm(tUi(uiLang, `Удалить страницу «${title}»?`, `Delete page "${title}"?`))) return;
+            try {
+                const snapshot = JSON.parse(JSON.stringify(ent));
+                await mutateBookAtomically(bookId, (fresh) => {
+                    delete fresh.entries[uid];
+                });
+                state.lastDeletedEntry = { bookId, uid, entry: snapshot };
+                requestRender({ preserveBodyScroll: true });
+            } catch (err) { window.alert(err?.message || String(err)); }
         }));
 
         // Entry editor events
@@ -1530,11 +2132,16 @@ export function createForgeController(deps) {
             }));
 
             win.querySelector('#pcx-fge-comment')?.addEventListener('input', e => { d.comment = e.target.value; });
-            win.querySelector('#pcx-fge-keys')?.addEventListener('input', e => { d.key = e.target.value.split(',').map(k => k.trim()).filter(Boolean); });
+            win.querySelector('#pcx-fge-keys')?.addEventListener('input', e => {
+                state.entryKeysDirty = true;
+                state.entryKeysRawText = e.target.value;
+                d.key = parseSmartTriggerKeys(e.target.value);
+            });
             win.querySelector('#pcx-fge-genkeys')?.addEventListener('click', () => { captureEntryFields(win); generateKeysForCurrentDraft(); });
             win.querySelector('#pcx-fge-trig')?.addEventListener('change', e => { d.constant = (e.target.value === 'const'); d.vectorized = (e.target.value === 'vec'); });
             win.querySelector('#pcx-fge-pos')?.addEventListener('change', e => { captureEntryFields(win); d.position = Number(e.target.value); requestRender({ preserveBodyScroll: true }); });
-            win.querySelector('#pcx-fge-depth')?.addEventListener('input', e => { d.depth = Math.max(0, Number(e.target.value) || 0); });
+            win.querySelector('#pcx-fge-depth')?.addEventListener('input', e => { d.depth = parseSafeDepth(e.target.value, 0); });
+            win.querySelector('#pcx-fge-outlet')?.addEventListener('input', e => { d.outletName = e.target.value; });
             win.querySelector('#pcx-fge-role')?.addEventListener('change', e => { d.role = Number(e.target.value); });
             win.querySelector('#pcx-fge-content')?.addEventListener('input', e => { d.content = e.target.value; });
             win.querySelector('#pcx-fge-prevrec')?.addEventListener('change', e => { d.preventRecursion = e.target.checked; });
@@ -1557,7 +2164,7 @@ export function createForgeController(deps) {
                 captureEntryFields(win);
                 if (!String(d.content || '').trim()) return;
                 await saveDraftToTargetBook(d);
-                requestRender();
+                requestRender({ preserveBodyScroll: true });
             });
 
             // Single Page AI Preset, Word Count & Prompt Editor
@@ -1603,11 +2210,13 @@ export function createForgeController(deps) {
                 const chosen = state.pageAiCandidates[state.pageAiCandIdx];
                 if (!chosen) return;
                 d.comment = chosen.comment || d.comment;
-                d.key = String(chosen.keys || '').split(',').map(k => k.trim()).filter(Boolean);
+                d.key = parseSmartTriggerKeys(chosen.keys);
+                state.entryKeysRawText = d.key.join(', ');
+                state.entryKeysDirty = true;
                 d.content = formatCleanParagraphs(chosen.content);
                 d.constant = Boolean(chosen.constant);
                 await saveDraftToTargetBook(d);
-                requestRender();
+                requestRender({ preserveBodyScroll: true });
             });
         }
 
@@ -1688,7 +2297,8 @@ export function createForgeController(deps) {
             win.querySelectorAll('.pcx-st-pos').forEach(el => el.addEventListener('change', () => {
                 state.stagedEntries[Number(el.dataset.idx)].position = Number(el.value); requestRender({ preserveBodyScroll: true });
             }));
-            win.querySelectorAll('.pcx-st-depth').forEach(el => el.addEventListener('input', () => { state.stagedEntries[Number(el.dataset.idx)].depth = Math.max(0, Number(el.value) || 0); }));
+            win.querySelectorAll('.pcx-st-depth').forEach(el => el.addEventListener('input', () => { state.stagedEntries[Number(el.dataset.idx)].depth = parseSafeDepth(el.value, 0); }));
+            win.querySelectorAll('.pcx-st-outlet').forEach(el => el.addEventListener('input', () => { state.stagedEntries[Number(el.dataset.idx)].outletName = el.value; }));
             win.querySelectorAll('.pcx-st-role').forEach(el => el.addEventListener('change', () => { state.stagedEntries[Number(el.dataset.idx)].role = Number(el.value); }));
             win.querySelectorAll('.pcx-st-content').forEach(el => el.addEventListener('input', () => { state.stagedEntries[Number(el.dataset.idx)].content = el.value; }));
             win.querySelector('#pcx-fg-commit-btn')?.addEventListener('click', commitApprovedLorebook);
@@ -1697,9 +2307,36 @@ export function createForgeController(deps) {
 
     return {
         onEnterForge() { fetchBooksList().then(() => requestRender()); },
+        onExternalWorldInfoUpdated(bookName, bookData) {
+            if (!bookName || savingBooksNow.has(bookName)) return false;
+            let changed = false;
+            if (bookData && typeof bookData === 'object') {
+                const normalized = normalizeLoadedEntries(JSON.parse(JSON.stringify(bookData)));
+                state.bookCounts[bookName] = Object.keys(normalized.entries || {}).length;
+                if (state.activeBookId === bookName && !this.isEditingForm) {
+                    state.activeBookData = normalized;
+                }
+                changed = true;
+            }
+            if (!state.books.some(b => b.file_id === bookName)) {
+                fetchBooksList().then(() => requestRender({ preserveBodyScroll: true })).catch(() => {});
+                changed = true;
+            }
+            return changed;
+        },
         renderForgeBody,
         bindForgeEvents,
         captureForgeFields: captureEntryFields,
+        resetTransientState() {
+            forgeAiSeq++;
+            state.saveError = '';
+            state.pageAiGenerating = false;
+            state.keysGenerating = false;
+            state.wizForging = false;
+        },
+        get isEditingForm() {
+            return state.screen === 'entry_edit' || state.screen === 'approve' || state.screen === 'new_book' || state.screen === 'wizard';
+        },
         get isBusy() { return state.wizForging || state.pageAiGenerating || state.keysGenerating; },
     };
 }

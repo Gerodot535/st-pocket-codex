@@ -20,12 +20,153 @@ export function formatCleanParagraphs(rawText) {
     return t;
 }
 
-export function analyzeBookRecursion(entriesObj, participantNames = []) {
+export function parseSmartTriggerKeys(rawInput) {
+    if (Array.isArray(rawInput)) {
+        return rawInput.map(k => String(k ?? '').trim()).filter(Boolean);
+    }
+    const str = String(rawInput ?? '');
+    if (!str.trim()) return [];
+    const out = [];
+    let cur = '';
+    let inRegex = false;
+    let escaped = false;
+    for (let i = 0; i < str.length; i++) {
+        const ch = str[i];
+        if (escaped) {
+            cur += ch;
+            escaped = false;
+            continue;
+        }
+        if (ch === '\\') {
+            cur += ch;
+            escaped = true;
+            continue;
+        }
+        if (!inRegex && ch === '/' && cur.trim() === '') {
+            inRegex = true;
+            cur += ch;
+            continue;
+        }
+        if (inRegex && ch === '/') {
+            cur += ch;
+            while (i + 1 < str.length && /[gimsuy]/.test(str[i + 1])) {
+                cur += str[++i];
+            }
+            inRegex = false;
+            continue;
+        }
+        if (!inRegex && ch === ',') {
+            const trimmed = cur.trim();
+            if (trimmed) out.push(trimmed);
+            cur = '';
+            continue;
+        }
+        cur += ch;
+    }
+    if (cur.trim()) out.push(cur.trim());
+    return out;
+}
+
+export function isSchemaUnsupportedError(err) {
+    const msg = String(err?.message || err || '').toLowerCase();
+    if (!msg) return false;
+    if (/(429|rate limit|quota|502|503|504|timeout|timed out|eof|network|fetch failed|aborted|unauthorized|401|403|unavailable)/i.test(msg)) {
+        return false;
+    }
+    return /(json_schema|response_format|schema|structured|invalid_argument|400|unsupported|unrecognized|not supported)/i.test(msg);
+}
+
+export function unwrapAndParseModelJson(raw, expectedKind = 'any') {
+    let cur = raw;
+    for (let depth = 0; depth < 3; depth++) {
+        if (!cur || typeof cur !== 'object' || Array.isArray(cur)) break;
+        const keys = Object.keys(cur);
+        const isStEnvelope = ('reasoning' in cur && 'content' in cur && (
+            expectedKind === 'book' ||
+            expectedKind === 'keys' ||
+            expectedKind === 'verbatim_keys' ||
+            typeof cur.content === 'object' ||
+            (expectedKind === 'page' && cur.keys === undefined) ||
+            (expectedKind === 'note' && cur.title === undefined)
+        )) || (keys.length > 0 && keys.every(k => k === 'content' || k === 'reasoning') && (
+            typeof cur.content === 'object' ||
+            (typeof cur.content === 'string' && cur.content.trim().startsWith('{')) ||
+            (typeof cur.content === 'string' && cur.content.includes('```'))
+        ));
+        if (isStEnvelope) {
+            cur = cur.content;
+            continue;
+        }
+        if (Array.isArray(cur.choices) && cur.choices[0]?.message?.content !== undefined) {
+            cur = cur.choices[0].message.content;
+            continue;
+        }
+        break;
+    }
+
+    if (cur && typeof cur === 'object' && !Array.isArray(cur)) {
+        return cur;
+    }
+
+    let txt = typeof cur === 'string' ? cur : String(cur?.text || cur?.content || '');
+    txt = txt
+        .replace(/<think>[\s\S]*?<\/think>/gi, '')
+        .replace(/^```(?:json)?\s*/i, '')
+        .replace(/\s*```$/i, '')
+        .trim();
+    if (!txt) return null;
+    try {
+        return JSON.parse(txt);
+    } catch {}
+    const fb = txt.indexOf('{'), lb = txt.lastIndexOf('}');
+    if (fb !== -1 && lb > fb) {
+        try { return JSON.parse(txt.slice(fb, lb + 1)); } catch {}
+    }
+    return null;
+}
+
+export function matchTriggerKeyInText(haystackLower, rawHaystack, rawKey, wholeWords = true, caseSens = false) {
+    const k = String(rawKey || '').trim();
+    if (!k) return false;
+    const rxMatch = k.match(/^\/(.+)\/([gimsuy]*)$/);
+    if (rxMatch) {
+        try { return new RegExp(rxMatch[1], rxMatch[2]).test(rawHaystack); } catch { return false; }
+    }
+    const hay = caseSens ? rawHaystack : haystackLower;
+    const needle = caseSens ? k : k.toLowerCase();
+    if (wholeWords && /^[\p{L}\p{N}_-]+$/u.test(needle)) {
+        const esc = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        try {
+            const re = new RegExp(`(^|[^\\p{L}\\p{N}_])${esc}(?=$|[^\\p{L}\\p{N}_])`, caseSens ? 'u' : 'iu');
+            return re.test(rawHaystack);
+        } catch {}
+    }
+    return hay.includes(needle);
+}
+
+export function checkEntrySecondaryKeysInText(lowContent, rawContent, dst, wholeWords = true, caseSens = false) {
+    if (dst.selective === false) return true;
+    const secKeys = Array.isArray(dst.keysecondary)
+        ? dst.keysecondary.map(k => String(k || '').trim()).filter(Boolean)
+        : [];
+    if (secKeys.length === 0) return true;
+    const logic = Number(dst.selectiveLogic) || 0;
+    const matches = secKeys.map(sk => matchTriggerKeyInText(lowContent, rawContent, sk, wholeWords, caseSens));
+    if (logic === 0) return matches.some(Boolean);
+    if (logic === 1) return !matches.every(Boolean);
+    if (logic === 2) return !matches.some(Boolean);
+    if (logic === 3) return matches.every(Boolean);
+    return matches.some(Boolean);
+}
+
+export function analyzeBookRecursion(entriesObj, participantNames = [], wiDefaults = {}) {
     const entries = Object.values(entriesObj || {}).filter(e => e && !e.disable);
     const outMap = {};
     const inMap = {};
     const broadWarnings = [];
     const partLower = participantNames.filter(Boolean).map(s => String(s).trim().toLowerCase());
+    const defWholeWords = wiDefaults.matchWholeWords !== undefined ? Boolean(wiDefaults.matchWholeWords) : true;
+    const defCaseSens = Boolean(wiDefaults.caseSensitive);
 
     for (const e of entries) {
         outMap[e.uid] = [];
@@ -53,40 +194,6 @@ export function analyzeBookRecursion(entriesObj, participantNames = []) {
         }
     }
 
-    const matchKeyInText = (haystackLower, rawHaystack, rawKey, wholeWords = true, caseSens = false) => {
-        const k = String(rawKey || '').trim();
-        if (!k) return false;
-        const rxMatch = k.match(/^\/(.+)\/([gimsuy]*)$/);
-        if (rxMatch) {
-            try { return new RegExp(rxMatch[1], rxMatch[2]).test(rawHaystack); } catch { return false; }
-        }
-        const hay = caseSens ? rawHaystack : haystackLower;
-        const needle = caseSens ? k : k.toLowerCase();
-        if (wholeWords && /^[\p{L}\p{N}_-]+$/u.test(needle)) {
-            const esc = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-            try {
-                const re = new RegExp(`(^|[^\\p{L}\\p{N}_])${esc}(?=$|[^\\p{L}\\p{N}_])`, caseSens ? 'u' : 'iu');
-                return re.test(rawHaystack);
-            } catch {}
-        }
-        return hay.includes(needle);
-    };
-
-    const checkSecondaryKeys = (lowContent, rawContent, dst, wholeWords, caseSens) => {
-        if (!dst.selective) return true;
-        const secKeys = Array.isArray(dst.keysecondary)
-            ? dst.keysecondary.map(k => String(k || '').trim()).filter(Boolean)
-            : [];
-        if (secKeys.length === 0) return true;
-        const logic = Number(dst.selectiveLogic) || 0; // 0: AND_ANY, 1: NOT_ALL, 2: NOT_ANY, 3: AND_ALL
-        const matches = secKeys.map(sk => matchKeyInText(lowContent, rawContent, sk, wholeWords, caseSens));
-        if (logic === 0) return matches.some(Boolean);
-        if (logic === 1) return !matches.every(Boolean);
-        if (logic === 2) return !matches.some(Boolean);
-        if (logic === 3) return matches.every(Boolean);
-        return matches.some(Boolean);
-    };
-
     for (const src of entries) {
         if (src.preventRecursion) continue;
         const rawContent = String(src.content || '');
@@ -96,57 +203,67 @@ export function analyzeBookRecursion(entriesObj, participantNames = []) {
         for (const dst of entries) {
             if (String(src.uid) === String(dst.uid)) continue;
             if (dst.constant || dst.excludeRecursion) continue;
-            const wholeWords = dst.matchWholeWords !== false;
-            const caseSens = Boolean(dst.caseSensitive);
+            const wholeWords = (dst.matchWholeWords !== null && dst.matchWholeWords !== undefined)
+                ? Boolean(dst.matchWholeWords)
+                : defWholeWords;
+            const caseSens = (dst.caseSensitive !== null && dst.caseSensitive !== undefined)
+                ? Boolean(dst.caseSensitive)
+                : defCaseSens;
             const keys = Array.isArray(dst.key) ? dst.key : [];
             let hitKey = '';
             for (const k of keys) {
-                if (matchKeyInText(lowContent, rawContent, k, wholeWords, caseSens)) { hitKey = String(k).trim(); break; }
+                if (matchTriggerKeyInText(lowContent, rawContent, k, wholeWords, caseSens)) { hitKey = String(k).trim(); break; }
             }
-            if (hitKey && checkSecondaryKeys(lowContent, rawContent, dst, wholeWords, caseSens)) {
+            if (hitKey && checkEntrySecondaryKeysInText(lowContent, rawContent, dst, wholeWords, caseSens)) {
                 outMap[src.uid].push({ uid: dst.uid, title: dst.comment || ('#' + dst.uid), key: hitKey });
                 inMap[dst.uid].push({ uid: src.uid, title: src.comment || ('#' + src.uid), key: hitKey });
             }
         }
     }
 
-    // Detect 2-step mutual loops A <-> B and 3-step cycles A -> B -> C -> A
+    // Detect cycles of arbitrary length (2, 3, 4+) via DFS
     const loops = [];
     const seenCycles = new Set();
     const byUid = new Map(entries.map(e => [String(e.uid), e]));
 
-    for (const a of entries) {
-        const aId = String(a.uid);
-        for (const ab of (outMap[a.uid] || [])) {
-            const bId = String(ab.uid);
-            const backBA = (outMap[ab.uid] || []).find(x => String(x.uid) === aId);
-            if (backBA) {
-                const sig = [aId, bId].sort().join('<->');
-                if (!seenCycles.has(sig)) {
-                    seenCycles.add(sig);
-                    loops.push({
-                        uids: [a.uid, ab.uid],
-                        label: `«${a.comment || ('#' + a.uid)}» <-> «${ab.title}» (ключи: ${ab.key} / ${backBA.key})`,
-                    });
-                }
-            }
-            for (const bc of (outMap[ab.uid] || [])) {
-                const cId = String(bc.uid);
-                if (cId === aId || cId === bId) continue;
-                const backCA = (outMap[bc.uid] || []).find(x => String(x.uid) === aId);
-                if (backCA) {
-                    const sig3 = [aId, bId, cId].sort().join('<->');
-                    if (!seenCycles.has(sig3)) {
-                        seenCycles.add(sig3);
-                        const bTitle = byUid.get(bId)?.comment || ('#' + bId);
+    const canonicalCycleSig = (cycleIds) => {
+        const n = cycleIds.length;
+        let best = '';
+        for (let i = 0; i < n; i++) {
+            const rot = cycleIds.slice(i).concat(cycleIds.slice(0, i)).join('->');
+            if (!best || rot < best) best = rot;
+        }
+        return best;
+    };
+
+    for (const startEntry of entries) {
+        const startId = String(startEntry.uid);
+        const dfs = (currId, pathIds, visitedInPath) => {
+            if (loops.length >= 24) return;
+            for (const edge of (outMap[byUid.get(currId)?.uid] || [])) {
+                const nextId = String(edge.uid);
+                if (nextId === startId && pathIds.length >= 2) {
+                    const sig = canonicalCycleSig(pathIds);
+                    if (!seenCycles.has(sig)) {
+                        seenCycles.add(sig);
+                        const titles = pathIds.map(id => `«${byUid.get(id)?.comment || ('#' + id)}»`);
                         loops.push({
-                            uids: [a.uid, ab.uid, bc.uid],
-                            label: `Кольцо из 3 страниц: «${a.comment || ('#' + a.uid)}» -> «${bTitle}» -> «${bc.title}»`,
+                            uids: pathIds.map(id => byUid.get(id)?.uid ?? id),
+                            label: pathIds.length === 2
+                                ? `${titles[0]} <-> ${titles[1]}`
+                                : `${titles.join(' -> ')} -> ${titles[0]}`,
                         });
                     }
+                } else if (!visitedInPath.has(nextId) && pathIds.length < 8 && byUid.has(nextId)) {
+                    visitedInPath.add(nextId);
+                    pathIds.push(nextId);
+                    dfs(nextId, pathIds, visitedInPath);
+                    pathIds.pop();
+                    visitedInPath.delete(nextId);
                 }
             }
-        }
+        };
+        dfs(startId, [startId], new Set([startId]));
     }
 
     const chains = [];
