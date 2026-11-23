@@ -158,10 +158,11 @@ export function buildPresetAlignedMessages(
         };
     };
 
-    const correctionClean = String(presetCorrectionPrompt || '').trim();
-    const finalUserTask = correctionClean
-        ? `${userTaskContent}\n\n${correctionClean}`
-        : userTaskContent;
+    const correctionClean = String(presetCorrectionPrompt || '').trim() || "ВАЖНО (СЛУЖЕБНЫЙ РЕЖИМ POCKET CODEX): Сейчас НЕ пиши художественный ответ от лица персонажа и НЕ продолжай сцену ролевой игры. Выполни строго задачу Соавтора / Кузницы выше, соблюдая все прямые указания автора и требуемый формат ответа.";
+    const sysFocalBlock = systemPrompt
+        ? `[СЛУЖЕБНАЯ ИНСТРУКЦИЯ ШАБЛОНА POCKET CODEX]\n${systemPrompt}\n\n`
+        : '';
+    const finalUserTask = `${sysFocalBlock}${userTaskContent}\n\n${correctionClean}`;
 
     if (systemPrompt) {
         messages.push({ role: 'system', content: systemPrompt });

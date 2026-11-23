@@ -491,6 +491,9 @@ function normalizeStore(store) {
         store.categories = JSON.parse(JSON.stringify(DEFAULT_CATEGORIES));
     }
     if (!Array.isArray(store.notes)) store.notes = [];
+    store.categories = store.categories.filter(c => c && !String(c.id || '').startsWith('stress_'));
+    if (store.categories.length === 0) store.categories = JSON.parse(JSON.stringify(DEFAULT_CATEGORIES));
+    store.notes = store.notes.filter(n => n && !String(n.id || '').startsWith('stress_') && n.content !== 'Контекст черновика для проверки шаблона без ввода текста.');
     for (const c of store.categories) {
         if (c.enabled === undefined) c.enabled = true;
         c.injectPos = c.injectPos !== undefined ? Number(c.injectPos) : ST_POS.IN_CHAT;
@@ -779,12 +782,24 @@ async function runAiNoteGeneration({ taskText, currentDraftText, attachments, pr
         if (docs.length) parts.push('[Прикреплённые файлы]\n' + docs.map(d => `--- ${d.name} ---\n${d.text.slice(0, 15000)}`).join('\n\n'));
     }
     if (previousCandidate && refinementInstruction) {
-        parts.push(`[Исходный запрос]\n${taskText.trim() || '(нет)'}`);
+        parts.push(`[Исходный запрос]\n${taskText.trim() || `(Шаблон: ${activePreset.name})`}`);
         parts.push(`[Предыдущий вариант]\nЗаголовок: ${previousCandidate.title || ''}\nТекст:\n${previousCandidate.content || ''}`);
-        parts.push(`[Что изменить]\n${refinementInstruction.trim()}`);
+        parts.push(`[ПРЯМЫЕ УКАЗАНИЯ АВТОРА ПО ДОРАБОТКЕ (ВЫСШИЙ ПРИОРИТЕТ)]\n${refinementInstruction.trim()}`);
     } else {
+        const hasContext = parts.length > 0 || Boolean(currentDraftText && currentDraftText.trim());
+        if (!taskText.trim() && !hasContext) {
+            throw new Error(tUi(
+                uiLang,
+                'Сейчас не открыт чат персонажа — откройте диалог в Таверне или напишите коротко тему заметки в поле пожеланий выше.',
+                'No character chat is open right now — open a chat in SillyTavern or write a brief note topic in the wish box above.',
+            ));
+        }
         if (currentDraftText && currentDraftText.trim()) parts.push(`[Черновик]\n${currentDraftText.trim()}`);
-        parts.push(`[Запрос автора]\n${taskText.trim() || 'Доработай черновик.'}`);
+        if (taskText.trim()) {
+            parts.push(`[ПРЯМЫЕ УКАЗАНИЯ И ПОЖЕЛАНИЯ АВТОРА (ВЫСШИЙ ПРИОРИТЕТ)]\n${taskText.trim()}`);
+        } else {
+            parts.push(`[АКТИВНЫЙ ШАБЛОН СОАВТОРА: «${activePreset.name}»]\nАвтор выбрал готовый шаблон без дополнительного текста. Создай содержательную заметку строго по системной инструкции шаблона «${activePreset.name}», опираясь на переданный контекст.`);
+        }
     }
     if (s.aiTransportMode !== 'direct') {
         parts.push('Верни ответ строго в формате JSON: {"title": "Короткий заголовок", "content": "Чистый текст заметки с разделением абзацев"} (либо чистым текстом без лишних вступлений).');
@@ -1228,6 +1243,9 @@ function closeSubModal() {
 function openSubModal(kind, extra = {}) {
     const win = document.getElementById('pcx-window');
     captureCurrentEditFields(win);
+    if (kind === 'section') {
+        uiState.secReturnToManager = Boolean(extra.fromManager);
+    }
     uiState.subModal = kind;
     if (kind === 'section') {
         const store = getActiveStore();
@@ -1550,11 +1568,12 @@ function renderSubModal() {
                     }).join('')}
             </div>
             <div class="pcx-dlg-foot">
-                <span></span>
+                <button type="button" class="pcx-btn pcx-btn-soft" id="pcx-lay-open-secmgr">${ICONS.sliders}<span>${tUi(uiLang, 'Управление разделами', 'Manage Sections')}</span></button>
                 <button type="button" class="pcx-btn pcx-btn-primary" data-close-sub="1">${tUi(uiLang, 'Закрыть карту', 'Close Map')}</button>
             </div>
         `;
         subDlg.querySelectorAll('[data-close-sub]').forEach(b => b.addEventListener('click', closeSubModal));
+        subDlg.querySelector('#pcx-lay-open-secmgr')?.addEventListener('click', () => openSubModal('sections_manager'));
         subDlg.querySelector('#pcx-lay-glob-sw')?.addEventListener('click', () => {
             s.includeGlobalWithChat = !s.includeGlobalWithChat;
             saveAll();
@@ -1570,6 +1589,120 @@ function renderSubModal() {
         return;
     }
 
+    // 3B. SPACIOUS MOBILE SECTION MANAGER SHEET (REORDER ↑/↓, TOGGLE ON/OFF, EDIT ROUTE, ADD SECTION!)
+    if (uiState.subModal === 'sections_manager') {
+        const chatOpenNow = stApi.isChatOpen();
+        const mgrStore = getActiveStore();
+        const canDelSec = mgrStore.categories.length > 1;
+        subDlg.innerHTML = `
+            <div class="pcx-dlg-head">
+                <h2>${tUi(uiLang, 'Разделы Тетради', 'Notebook Sections')} (${mgrStore.categories.length})</h2>
+                <button type="button" class="pcx-sq-top-btn pcx-icon-only" data-close-sub="1">${ICONS.close}</button>
+            </div>
+            <div class="pcx-dlg-body">
+                <div class="pcx-seg-tabs">
+                    <button type="button" class="pcx-seg-tab ${s.scope === 'chat' && chatOpenNow ? 'pcx-active' : ''}" data-mgr-scope="chat" ${!chatOpenNow ? 'disabled' : ''}>
+                        ${chatOpenNow ? tUi(uiLang, 'Этот чат', 'This Chat') : tUi(uiLang, 'Нет чата', 'No Chat')}
+                    </button>
+                    <button type="button" class="pcx-seg-tab ${s.scope === 'global' || !chatOpenNow ? 'pcx-active' : ''}" data-mgr-scope="global">
+                        ${tUi(uiLang, 'Общая тетрадь', 'Global')}
+                    </button>
+                </div>
+
+                <div class="pcx-stack" style="gap:8px;">
+                    ${mgrStore.categories.map((cat, idx) => {
+                        const cnt = mgrStore.notes.filter(n => n.categoryId === cat.id && n.enabled !== false).length;
+                        const isEn = cat.enabled !== false;
+                        return `
+                            <div class="pcx-sec-mgr-card ${!isEn ? 'pcx-off-sec' : ''}">
+                                <div class="pcx-sec-mgr-top" style="align-items:center;">
+                                    <div style="min-width:0;flex:1;display:flex;align-items:center;gap:7px;flex-wrap:wrap;">
+                                        <span class="pcx-sec-mgr-title">${escapeHtml(displayCategoryName(cat, uiLang))}</span>
+                                        <span class="pcx-status-badge ${Number(cat.injectPos) === ST_POS.LOCAL_ONLY ? 'pcx-warm' : ''}">${escapeHtml(describeCategoryRouteShort(cat))}</span>
+                                        ${cnt > 0 ? `<span class="pcx-key-badge">${cnt}</span>` : ''}
+                                    </div>
+                                    <div class="pcx-actions" style="flex-wrap:nowrap;">
+                                        <button type="button" class="pcx-sq-switch" role="switch" aria-checked="${isEn}" data-mgr-toggle="${escapeHtml(cat.id)}" title="${tUi(uiLang, 'Вкл / Выкл', 'Toggle')}"><span></span></button>
+                                        ${canDelSec ? `<button type="button" class="pcx-order-btn" style="color:var(--danger);border-color:var(--danger);" data-mgr-del="${escapeHtml(cat.id)}" title="${tUi(uiLang, 'Удалить раздел', 'Delete section')}">${ICONS.close}</button>` : ''}
+                                    </div>
+                                </div>
+                                <div class="pcx-sec-mgr-foot" style="padding-top:6px;">
+                                    <div class="pcx-actions">
+                                        <button type="button" class="pcx-order-btn" data-mgr-move="up" data-id="${escapeHtml(cat.id)}" ${idx === 0 ? 'disabled' : ''}>${ICONS.chevUp}</button>
+                                        <button type="button" class="pcx-order-btn" data-mgr-move="down" data-id="${escapeHtml(cat.id)}" ${idx === mgrStore.categories.length - 1 ? 'disabled' : ''}>${ICONS.chevDown}</button>
+                                        <button type="button" class="pcx-btn pcx-btn-xs pcx-btn-soft" data-mgr-jump="${escapeHtml(cat.id)}">${tUi(uiLang, 'Открыть', 'Open')}</button>
+                                    </div>
+                                    <button type="button" class="pcx-btn pcx-btn-xs pcx-btn-secondary" data-mgr-route="${escapeHtml(cat.id)}">${ICONS.sliders}<span>${tUi(uiLang, 'Маршрут', 'Route')}</span></button>
+                                </div>
+                            </div>
+                        `;
+                    }).join('')}
+                </div>
+            </div>
+            <div class="pcx-dlg-foot">
+                <button type="button" class="pcx-btn pcx-btn-soft" id="pcx-mgr-add-sec">+ ${tUi(uiLang, 'Раздел', 'Section')}</button>
+                <button type="button" class="pcx-btn pcx-btn-primary" data-close-sub="1">${tUi(uiLang, 'Готово', 'Done')}</button>
+            </div>
+        `;
+
+        subDlg.querySelectorAll('[data-close-sub]').forEach(b => b.addEventListener('click', closeSubModal));
+        subDlg.querySelectorAll('[data-mgr-scope]').forEach(b => b.addEventListener('click', () => {
+            if (b.disabled) return;
+            s.scope = b.dataset.mgrScope;
+            saveAll();
+            renderModal({ preserveBodyScroll: true });
+            renderSubModal();
+        }));
+        subDlg.querySelectorAll('[data-mgr-toggle]').forEach(sw => sw.addEventListener('click', () => {
+            const c = mgrStore.categories.find(x => x.id === sw.dataset.mgrToggle);
+            if (!c) return;
+            c.enabled = c.enabled === false;
+            saveAll();
+            renderModal({ preserveBodyScroll: true });
+            renderSubModal();
+        }));
+        subDlg.querySelectorAll('[data-mgr-del]').forEach(btn => btn.addEventListener('click', () => {
+            if (mgrStore.categories.length <= 1) return;
+            const target = mgrStore.categories.find(x => x.id === btn.dataset.mgrDel);
+            if (!target) return;
+            const noteCnt = mgrStore.notes.filter(n => n.categoryId === target.id).length;
+            if (noteCnt > 0 && !window.confirm(tUi(uiLang, `Удалить раздел «${target.name}» и его записи (${noteCnt} шт.)?`, `Delete section "${target.name}" and its ${noteCnt} notes?`))) return;
+            mgrStore.notes = mgrStore.notes.filter(n => n.categoryId !== target.id);
+            mgrStore.categories = mgrStore.categories.filter(x => x.id !== target.id);
+            if (!mgrStore.categories.some(x => x.id === s.activeTab)) s.activeTab = mgrStore.categories[0].id;
+            saveAll();
+            renderModal({ preserveBodyScroll: true });
+            renderSubModal();
+        }));
+        subDlg.querySelectorAll('[data-mgr-move]').forEach(btn => btn.addEventListener('click', () => {
+            const idx = mgrStore.categories.findIndex(x => x.id === btn.dataset.id);
+            if (idx === -1) return;
+            const swapIdx = btn.dataset.mgrMove === 'up' ? idx - 1 : idx + 1;
+            if (swapIdx < 0 || swapIdx >= mgrStore.categories.length) return;
+            const tmp = mgrStore.categories[idx];
+            mgrStore.categories[idx] = mgrStore.categories[swapIdx];
+            mgrStore.categories[swapIdx] = tmp;
+            saveAll();
+            renderModal({ preserveBodyScroll: true });
+            renderSubModal();
+        }));
+        subDlg.querySelectorAll('[data-mgr-jump]').forEach(btn => btn.addEventListener('click', () => {
+            s.activeTab = btn.dataset.mgrJump;
+            uiState.wing = 'codex';
+            uiState.codexSub = 'list';
+            saveAll();
+            closeSubModal();
+            renderModal();
+        }));
+        subDlg.querySelectorAll('[data-mgr-route]').forEach(btn => btn.addEventListener('click', () => {
+            openSubModal('section', { mode: 'edit', catId: btn.dataset.mgrRoute, fromManager: true });
+        }));
+        subDlg.querySelector('#pcx-mgr-add-sec')?.addEventListener('click', () => {
+            openSubModal('section', { mode: 'create', fromManager: true });
+        });
+        return;
+    }
+
     // 4. SECTION ROUTE & HEADER MODAL (1:1 Concept openSectionRouteModal!)
     if (uiState.subModal === 'section' && uiState.secDraft) {
         const d = uiState.secDraft;
@@ -1578,7 +1711,7 @@ function renderSubModal() {
             <div class="pcx-dlg-head">
                 <div>
                     <h2>${uiState.secModalMode === 'create' ? tUi(uiLang, 'Новый раздел Тетради', 'New Notebook Section') : tUi(uiLang, 'Индивидуальный маршрут раздела', 'Section Route & Header')}</h2>
-                    <small>${tUi(uiLang, 'Каждый раздел Тетради падает в свою собственную точку промпта независимо от соседних вкладок.', 'Every Notebook section routes to its own prompt layer independently.')}</small>
+
                 </div>
                 <button type="button" class="pcx-sq-top-btn pcx-icon-only" data-close-sub="1">${ICONS.close}</button>
             </div>
@@ -1688,8 +1821,9 @@ function renderSubModal() {
             store.categories = store.categories.filter(c => c.id !== target.id);
             s.activeTab = store.categories[0].id;
             saveAll();
-            closeSubModal();
             renderModal({ preserveBodyScroll: true });
+            if (uiState.secReturnToManager) openSubModal('sections_manager');
+            else closeSubModal();
         });
         subDlg.querySelector('#pcx-sec-save')?.addEventListener('click', () => {
             syncDraftAndPreview();
@@ -1704,8 +1838,9 @@ function renderSubModal() {
                 if (target) Object.assign(target, { ...d, id: target.id, name: cleanName });
             }
             saveAll();
-            closeSubModal();
             renderModal({ preserveBodyScroll: true });
+            if (uiState.secReturnToManager) openSubModal('sections_manager');
+            else closeSubModal();
         });
         return;
     }
@@ -1936,14 +2071,14 @@ function renderHomeView(s, store, uiLang, chatOpen) {
                     </summary>
                     <div class="pcx-spoiler-body">
                         ${store.categories.map(cat => `
-                            <div class="pcx-actions pcx-between" style="padding-bottom:6px;border-bottom:1px solid var(--line);">
-                                <strong style="font-size:0.84rem;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(displayCategoryName(cat, uiLang))}</strong>
+                            <div class="pcx-surface" style="padding:9px 11px;display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;${cat.enabled === false ? 'opacity:0.6;' : ''}">
+                                <strong style="font-size:0.87rem;line-height:1.3;flex:1;min-width:130px;">${escapeHtml(displayCategoryName(cat, uiLang))}</strong>
                                 <button type="button" class="pcx-chip ${cat.enabled === false ? 'pcx-off-sec' : ''}" data-edit-sec-modal="${escapeHtml(cat.id)}">${escapeHtml(describeCategoryRouteShort(cat))}</button>
                             </div>
                         `).join('')}
                         <div class="pcx-actions pcx-between" style="padding-top:4px;">
-                            <button type="button" class="pcx-btn pcx-btn-xs pcx-btn-secondary" data-open-layers="1">${tUi(uiLang, 'Полная карта слоёв', 'Full Layer Map')}</button>
-                            <button type="button" class="pcx-btn pcx-btn-xs pcx-btn-soft" data-add-sec-modal="1">+ ${tUi(uiLang, 'Новый раздел', 'New Section')}</button>
+                            <button type="button" class="pcx-btn pcx-btn-sm pcx-btn-secondary" data-open-secmgr="1">${ICONS.sliders}<span>${tUi(uiLang, 'Все разделы и порядок', 'Manage Sections')}</span></button>
+                            <button type="button" class="pcx-btn pcx-btn-sm pcx-btn-soft" data-add-sec-modal="1">+ ${tUi(uiLang, 'Новый раздел', 'New Section')}</button>
                         </div>
                     </div>
                 </details>
@@ -1968,11 +2103,7 @@ function renderCodexShelfView(s, uiLang, chatOpen) {
         <div class="pcx-page-head">
             <div>
                 <h1>${tUi(uiLang, 'Тетради Автора', "Author's Notebooks")}</h1>
-                <p>${tUi(
-                    uiLang,
-                    'Выберите нужную Тетрадь на полке: заметки не вываливаются кучей, у каждой Тетради своя обложка и свои разделы маршрутизации.',
-                    'Choose a Notebook volume below: each Notebook has its own cover art and independent prompt-routed sections.',
-                )}</p>
+
             </div>
             <div class="pcx-actions">
                 <button type="button" class="pcx-btn pcx-btn-secondary" data-open-layers="1">${tUi(uiLang, 'Карта слоёв промпта', 'Prompt Layer Map')}</button>
@@ -2069,11 +2200,7 @@ function renderCodexListView(s, store, currentCat, uiLang, chatOpen) {
         <div class="pcx-page-head">
             <div>
                 <h1>${escapeHtml(nbHeading)}</h1>
-                <p>${tUi(
-                    uiLang,
-                    'У каждого раздела — свой маршрут падения в промпт. Свайпайте карусель разделов и перетаскивайте разделы или карточки за ручку «⋮⋮».',
-                    'Every section routes independently. Swipe the section carousel smoothly or drag sections and cards by the grip handle.',
-                )}</p>
+
             </div>
             <div class="pcx-actions">
                 <button type="button" class="pcx-btn pcx-btn-secondary" data-open-layers="1">${tUi(uiLang, 'Карта слоёв', 'Layer Map')}</button>
@@ -2105,9 +2232,10 @@ function renderCodexListView(s, store, currentCat, uiLang, chatOpen) {
                 const isAct = c.id === currentCat.id;
                 return `
                     <button type="button" class="pcx-chip ${isAct ? 'pcx-active' : ''} ${c.enabled === false ? 'pcx-off-sec' : ''}" data-sec-tab="${escapeHtml(c.id)}">
-                        <span class="pcx-sec-grip" title="${tUi(uiLang, 'Потяните за ручку, чтобы переставить раздел', 'Drag handle to reorder section')}">${ICONS.gripSm}</span>
+                        <span class="pcx-sec-grip" title="${tUi(uiLang, 'Потяните, чтобы переставить раздел', 'Drag to reorder')}">${ICONS.gripSm}</span>
                         <span>${escapeHtml(displayCategoryName(c, uiLang))}</span>
                         <span class="pcx-key-badge">${cnt}</span>
+                        ${store.categories.length > 1 ? `<span class="pcx-tab-del-x" data-del-sec-tab="${escapeHtml(c.id)}" title="${tUi(uiLang, 'Удалить раздел', 'Delete section')}">×</span>` : ''}
                     </button>`;
             }).join('')}
             <button type="button" class="pcx-chip" id="pcx-add-tab-btn" data-add-sec-modal="1">+ ${tUi(uiLang, 'Раздел', 'Section')}</button>
@@ -2117,11 +2245,13 @@ function renderCodexListView(s, store, currentCat, uiLang, chatOpen) {
             <div class="pcx-sec-route-info">
                 <strong>${escapeHtml(displayCategoryName(currentCat, uiLang))}:</strong>
                 <span class="pcx-status-badge ${Number(currentCat.injectPos) === ST_POS.LOCAL_ONLY ? 'pcx-warm' : ''}">${escapeHtml(describeCategoryRouteShort(currentCat))}</span>
-                <small>· ${escapeHtml(describeHeaderModeLabel(currentCat.headerMode, uiLang))}</small>
             </div>
-            <button type="button" class="pcx-btn pcx-btn-sm pcx-btn-secondary" data-edit-sec-modal="${escapeHtml(currentCat.id)}">
-                ${tUi(uiLang, 'Маршрут и шапка раздела', 'Section Route & Header')}
-            </button>
+            <div class="pcx-actions">
+                <button type="button" class="pcx-btn pcx-btn-sm pcx-btn-soft" data-open-secmgr="1">${ICONS.sliders}<span>${tUi(uiLang, `Разделы (${store.categories.length})`, `Sections (${store.categories.length})`)}</span></button>
+                <button type="button" class="pcx-btn pcx-btn-sm pcx-btn-secondary" data-edit-sec-modal="${escapeHtml(currentCat.id)}">
+                    ${tUi(uiLang, 'Маршрут раздела', 'Section Route')}
+                </button>
+            </div>
         </div>
 
         ${undoBarHtml}
@@ -2247,6 +2377,11 @@ function renderCodexNoteEditorView(s, store, currentCat, uiLang) {
                             ${store.categories.map(c => `<option value="${escapeHtml(c.id)}" ${c.id === catVal ? 'selected' : ''}>${escapeHtml(displayCategoryName(c, uiLang))} (${escapeHtml(describeCategoryRouteShort(c))})</option>`).join('')}
                         </select>
                     </label>
+                </div>
+
+                <div class="pcx-preset-active-bar">
+                    <strong>${tUi(uiLang, 'Выбран шаблон:', 'Selected preset:')} «${escapeHtml(uiLang === 'en' ? (activePreset.nameEn || activePreset.name) : activePreset.name)}»</strong>
+                    <small>${escapeHtml(activePreset.placeholder || '')} ${tUi(uiLang, '(Поле пожеланий ниже необязательно — можно запускать сразу по контексту чата или дописать свои уточнения).', '(Wish box below is optional — run immediately from chat context or add custom details).')}</small>
                 </div>
 
                 <div class="pcx-actions pcx-between">
@@ -2662,6 +2797,7 @@ function bindMainWindowEvents(win, s, store, currentCat, chatOpen) {
     win.querySelector('#pcx-btn-guide')?.addEventListener('click', () => openSubModal('guide'));
     win.querySelector('#pcx-btn-layers')?.addEventListener('click', () => openSubModal('layers'));
     win.querySelectorAll('[data-open-layers]').forEach(b => b.addEventListener('click', () => openSubModal('layers')));
+    win.querySelectorAll('[data-open-secmgr]').forEach(b => b.addEventListener('click', () => openSubModal('sections_manager')));
     win.querySelectorAll('[data-open-settings-modal]').forEach(b => b.addEventListener('click', () => openSubModal('settings')));
     win.querySelectorAll('[data-edit-sec-modal]').forEach(b => b.addEventListener('click', () => openSubModal('section', { mode: 'edit', catId: b.dataset.editSecModal })));
     win.querySelectorAll('[data-add-sec-modal]').forEach(b => b.addEventListener('click', () => openSubModal('section', { mode: 'create' })));
@@ -2810,8 +2946,23 @@ function bindMainWindowEvents(win, s, store, currentCat, chatOpen) {
         saveAll();
         renderModal({ preserveBodyScroll: true });
     });
+    win.querySelectorAll('[data-del-sec-tab]').forEach(delEl => delEl.addEventListener('click', e => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (store.categories.length <= 1) return;
+        const cid = delEl.dataset.delSecTab;
+        const target = store.categories.find(x => x.id === cid);
+        if (!target) return;
+        const noteCnt = store.notes.filter(n => n.categoryId === cid).length;
+        if (noteCnt > 0 && !window.confirm(tUi(s.uiLang || 'ru', `Удалить раздел «${target.name}» и его записи (${noteCnt} шт.)?`, `Delete section "${target.name}" and its ${noteCnt} notes?`))) return;
+        store.notes = store.notes.filter(n => n.categoryId !== cid);
+        store.categories = store.categories.filter(x => x.id !== cid);
+        if (!store.categories.some(x => x.id === s.activeTab)) s.activeTab = store.categories[0].id;
+        saveAll();
+        renderModal({ preserveBodyScroll: true });
+    }));
     win.querySelectorAll('[data-sec-tab]').forEach(tab => tab.addEventListener('click', e => {
-        if (e.target.closest('.pcx-sec-grip')) return;
+        if (e.target.closest('.pcx-sec-grip') || e.target.closest('[data-del-sec-tab]')) return;
         resetEditDrafts();
         s.activeTab = tab.dataset.secTab;
         saveAll();
@@ -3070,11 +3221,7 @@ function bindMainWindowEvents(win, s, store, currentCat, chatOpen) {
         const taskText = uiState.aiPromptDraft || '';
         const currentContent = uiState.draftContent || '';
         const atts = uiState.draftAttachments || [];
-        if (!taskText.trim() && !currentContent.trim() && !atts.length) {
-            uiState.aiStatus = 'Опишите задачу выше.';
-            renderModal({ preserveBodyScroll: true });
-            return;
-        }
+        // Preset can run directly from chat/character/draft context without forcing manual text input!
         const reqSeq = ++codexAiSeq;
         const chatAtStart = stApi.ctx?.getCurrentChatId?.() || stApi.ctx?.chatId || '';
         const scopeAtStart = s.scope;

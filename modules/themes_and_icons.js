@@ -892,8 +892,8 @@ dialog#pcx-sub-dialog button, dialog#pcx-sub-dialog input, dialog#pcx-sub-dialog
 .pcx-chip-row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
 
 .pcx-chip {
-    min-height: 31px !important;
-    padding: 4px 9px !important;
+    min-height: 36px !important;
+    padding: 6px 11px !important;
     border-radius: 6px !important;
     border: 1px solid var(--line) !important;
     background: var(--panel) !important;
@@ -916,6 +916,25 @@ dialog#pcx-sub-dialog button, dialog#pcx-sub-dialog input, dialog#pcx-sub-dialog
     opacity: 0.94;
     border-color: var(--accent) !important;
     box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35) !important;
+}
+.pcx-tab-del-x {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    margin-left: 2px;
+    border-radius: 4px;
+    color: var(--muted);
+    font-size: 13px;
+    line-height: 1;
+    font-weight: 700;
+    opacity: 0.78;
+}
+.pcx-tab-del-x:hover {
+    background: var(--danger-wash);
+    color: var(--danger);
+    opacity: 1;
 }
 .pcx-sec-grip {
     display: inline-flex;
@@ -1509,6 +1528,79 @@ dialog#pcx-sub-dialog::backdrop {
     font-size: 0.82rem;
 }
 
+
+/* SPACIOUS MOBILE-FRIENDLY SECTION MANAGER CARDS */
+.pcx-sec-mgr-card {
+    padding: 9px 11px;
+    border-radius: 9px;
+    border: 1px solid var(--line-strong);
+    background: var(--paper);
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 7px;
+}
+.pcx-sec-mgr-card.pcx-off-sec {
+    opacity: 0.62;
+    border-style: dashed;
+}
+.pcx-sec-mgr-top {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 10px;
+}
+.pcx-sec-mgr-title {
+    font-size: 0.95rem;
+    font-weight: 700;
+    line-height: 1.3;
+    color: var(--ink);
+    word-break: break-word;
+}
+.pcx-sec-mgr-sub {
+    margin-top: 3px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+}
+.pcx-sec-mgr-foot {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    flex-wrap: wrap;
+    padding-top: 8px;
+    border-top: 1px solid var(--line);
+}
+.pcx-order-btn {
+    width: 36px !important;
+    height: 34px !important;
+    min-height: 34px !important;
+    padding: 0 !important;
+    border-radius: 7px !important;
+    border: 1px solid var(--line-strong) !important;
+    background: var(--panel) !important;
+    color: var(--ink) !important;
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+}
+.pcx-order-btn:hover:not(:disabled) {
+    background: var(--wash) !important;
+    border-color: var(--accent) !important;
+}
+.pcx-preset-active-bar {
+    padding: 9px 12px;
+    border-radius: 8px;
+    border: 1px solid var(--line-strong);
+    background: var(--wash);
+    color: var(--ink);
+    font-size: 0.81rem;
+    line-height: 1.45;
+    display: grid;
+    gap: 3px;
+}
+
 /* MOBILE ADAPTATION (<= 820px) — 1:1 Concept */
 @media (max-width: 980px) {
     .pcx-shell { grid-template-columns: 172px minmax(0, 1fr); }
@@ -1554,6 +1646,25 @@ dialog#pcx-sub-dialog::backdrop {
         gap: 10px;
     }
     .pcx-pair, .pcx-hub-grid { grid-template-columns: 1fr !important; }
+    .pcx-row-3 { grid-template-columns: 1fr !important; gap: 10px !important; }
+    dialog#pcx-sub-dialog {
+        width: 100vw !important;
+        max-width: 100vw !important;
+        max-height: 93dvh !important;
+        margin: auto 0 0 0 !important;
+        border-radius: 14px 14px 0 0 !important;
+        border-left: 0 !important;
+        border-right: 0 !important;
+        border-bottom: 0 !important;
+    }
+    .pcx-dlg-head { padding: 15px 16px 12px; }
+    .pcx-dlg-body { padding: 15px 16px 18px; }
+    .pcx-dlg-foot { padding: 12px 16px max(14px, env(safe-area-inset-bottom)); }
+    #pcx-window .pcx-input, #pcx-window select.pcx-input,
+    dialog#pcx-sub-dialog .pcx-input, dialog#pcx-sub-dialog select.pcx-input {
+        min-height: 43px !important;
+        font-size: 0.92rem !important;
+    }
 }
 
 /* ANTI-SQUISH ARMOR (PREVENTS 55+ CARDS FROM EVER COLLAPSING INTO 1PX LINES) */

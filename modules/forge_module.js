@@ -11,6 +11,7 @@ import {
     matchTriggerKeyInText,
     checkEntrySecondaryKeysInText,
     tUi,
+    displayCategoryName,
 } from './presets_and_i18n.js';
 
 const FORGE_JSON_SCHEMA = {
@@ -1140,8 +1141,18 @@ export function createForgeController(deps) {
         const d = state.entryDraft;
         const prevCand = isRefinement ? state.pageAiCandidates[state.pageAiCandIdx] : null;
         if (isRefinement && (!prevCand || !state.pageAiRefineText.trim())) return;
-        if (!isRefinement && !state.pageAiTask.trim() && !(d?.content || '').trim()) {
-            state.pageAiStatus = tUi(uiLang, 'Опиши тему страницы выше (локацию, персонажа, предмет, закон мира).', 'Describe the page topic above (location, NPC, relic, world rule).');
+        const hasAnyPageContext = Boolean(
+            state.pageAiTask.trim()
+            || (d?.content || '').trim()
+            || (d?.comment || '').trim()
+            || (stApi.isChatOpen() && (state.pageAiUseChar || state.pageAiUseChat || state.pageAiUsePersona))
+        );
+        if (!isRefinement && !hasAnyPageContext) {
+            state.pageAiStatus = tUi(
+                uiLang,
+                'Сейчас не открыт чат персонажа — откройте диалог в Таверне или напишите коротко тему страницы в поле пожеланий выше.',
+                'No chat is open right now — open a character chat or write a brief topic in the request box above.',
+            );
             requestRender({ preserveBodyScroll: true });
             return;
         }
@@ -1214,8 +1225,13 @@ export function createForgeController(deps) {
                 blocks.push(`[Предыдущий вариант]\nНазвание: ${prevCand.comment}\nКлючи: ${prevCand.keys}\nТекст:\n${prevCand.content}`);
                 blocks.push(`[Что изменить]\n${refineAtStart.trim()}`);
             } else {
+                if (draftSnapshot?.comment && draftSnapshot.comment.trim()) blocks.push(`[Заголовок черновика]\n${draftSnapshot.comment.trim()}`);
                 if (draftSnapshot?.content && draftSnapshot.content.trim()) blocks.push(`[Черновик в редакторе]\n${draftSnapshot.content.trim()}`);
-                blocks.push(`[Запрос автора для новой страницы Лорбука]\n${taskAtStart.trim() || 'Развей черновик в полноценную оригинальную страницу Лорбука с абзацами и подбери ключи.'}`);
+                if (taskAtStart.trim()) {
+                    blocks.push(`[ПРЯМЫЕ УКАЗАНИЯ И ПОЖЕЛАНИЯ АВТОРА (ВЫСШИЙ ПРИОРИТЕТ)]\n${taskAtStart.trim()}`);
+                } else {
+                    blocks.push(`[АКТИВНЫЙ ШАБЛОН ЗАДАЧИ: «${preset.name}»]\nАвтор выбрал этот готовый шаблон без дополнительного текста. Создай содержательную страницу Лорбука с триггерными ключами строго по системной инструкции шаблона «${preset.name}», опираясь на переданный контекст.`);
+                }
             }
 
             const raw = await callForgeModel(sysPrompt, blocks.join('\n\n'), SINGLE_PAGE_JSON_SCHEMA, Math.max(1200, Number(s.aiMaxTokens) || 3400));
@@ -1340,10 +1356,16 @@ export function createForgeController(deps) {
             if (selectedNotes.length > 0) {
                 sourceBlocks.push('[Исходные заметки из Кодекса (опора канона)]\n' + selectedNotes.map((n, i) => `Запись #${i + 1} (${n.section} | ${n.title}):\n${n.content.trim()}`).join('\n\n'));
             }
-            if (state.wizCustomPrompt.trim()) sourceBlocks.push(`[Запрос автора / Тема и сеттинг Лорбука]\n${state.wizCustomPrompt.trim()}`);
         }
 
         const preset = getActiveForgeBookPreset();
+        if (state.wizMode !== 'verbatim_keys') {
+            if (state.wizCustomPrompt.trim()) {
+                sourceBlocks.push(`[ПРЯМЫЕ УКАЗАНИЯ АВТОРА / ТЕМА И СЕТТИНГ (ВЫСШИЙ ПРИОРИТЕТ)]\n${state.wizCustomPrompt.trim()}`);
+            } else if (sourceBlocks.length > 0) {
+                sourceBlocks.push(`[АКТИВНЫЙ ШАБЛОН КУЗНИЦЫ: «${preset.name}»]\nАвтор выбрал готовый шаблон без дополнительного текста. Создай страницы Лорбука строго по системной инструкции шаблона «${preset.name}», опираясь на переданный контекст.`);
+            }
+        }
         const rawBookTemplate = (s.forgeBookSystemPrompt && s.forgeBookSystemPrompt.trim())
             ? s.forgeBookSystemPrompt.trim()
             : preset.bookPrompt;
@@ -1387,7 +1409,7 @@ export function createForgeController(deps) {
         state.wizOriginSession = originSession;
         const { sysPrompt, userPrompt, verbatimItems } = buildDynamicForgePrompts();
 
-        if (state.wizMode === 'direct_no_ai') {
+        if (state.wizMode === 'direct_no_ai' || state.wizMode === 'direct') {
             if (verbatimItems.length === 0) {
                 state.wizStatus = tUi(uiLang, 'Отметь разделы Кодекса в спойлере ниже или прикрепи файл.', 'Select Codex sections below or attach a text file.');
                 requestRender(); return;
@@ -1673,7 +1695,7 @@ export function createForgeController(deps) {
                 <div class="pcx-page-head">
                     <div>
                         <h1>${tUi(uiLang, 'Что выковать в Кузнице?', 'What would you like to forge?')}</h1>
-                        <p>${tUi(uiLang, 'Выберите создание целого тома или отдельной страницы — с помощью Соавтора ИИ или полностью вручную.', 'Choose between forging a complete Lorebook tome or a single page — with AI or manually.')}</p>
+                        
                     </div>
                 </div>
                 <div class="pcx-hub-grid">
@@ -1781,7 +1803,7 @@ export function createForgeController(deps) {
                             <select id="pcx-fg-wiz-mode" class="pcx-input">
                                 <option value="ai_adapt" ${state.wizMode === 'ai_adapt' ? 'selected' : ''}>${tUi(uiLang, 'Генерация Лорбука с Соавтором ИИ', 'AI Lorebook Generation')}</option>
                                 <option value="verbatim_keys" ${state.wizMode === 'verbatim_keys' ? 'selected' : ''}>${tUi(uiLang, 'Мой текст дословно + ключи от ИИ', 'Verbatim Text + AI Trigger Keys')}</option>
-                                <option value="direct" ${state.wizMode === 'direct' ? 'selected' : ''}>${tUi(uiLang, 'Прямой перенос заметок из Тетради без ИИ', 'Direct Notebook Transfer (No AI)')}</option>
+                                <option value="direct_no_ai" ${(state.wizMode === 'direct_no_ai' || state.wizMode === 'direct') ? 'selected' : ''}>${tUi(uiLang, 'Прямой перенос заметок из Тетради без ИИ', 'Direct Notebook Transfer (No AI)')}</option>
                             </select>
                         </label>
                     </div>
@@ -1801,6 +1823,11 @@ export function createForgeController(deps) {
                                     <button type="button" class="pcx-btn pcx-btn-secondary" id="pcx-fg-toggle-book-prompt">${ICONS.sliders}<span>${state.showBookPromptEditor ? tUi(uiLang, 'Скрыть промпт', 'Hide Prompt') : tUi(uiLang, 'Промпт ИИ', 'System Prompt')}</span></button>
                                 </div>
                             </div>
+                        </div>
+
+                        <div class="pcx-preset-active-bar">
+                            <strong>${tUi(uiLang, 'Выбран шаблон:', 'Selected preset:')} «${escapeHtml(uiLang === 'en' ? (activePreset.nameEn || activePreset.name) : activePreset.name)}»</strong>
+                            <small>${escapeHtml(activePreset.placeholder || '')} ${tUi(uiLang, '(Поле пожеланий ниже необязательно — можно запускать сразу по контексту чата или вписать свои уточнения).', '(Wish box below is optional — run immediately from chat context or add custom details).')}</small>
                         </div>
 
                         ${activePreset.isCustom ? `
@@ -1851,7 +1878,7 @@ export function createForgeController(deps) {
                             </label>
                             <label class="pcx-field">
                                 <span>${tUi(uiLang, 'Язык текста', 'Output Language')}</span>
-                                <input type="text" id="pcx-fg-wiz-lang" class="pcx-input" value="${escapeHtml(s.aiLang || 'Русский')}">
+                                <select id="pcx-fg-wiz-lang" class="pcx-input">${LANGUAGES.map(l => `<option value="${escapeHtml(l.id)}" ${s.aiLang === l.id ? 'selected' : ''}>${escapeHtml(l.label)}</option>`).join('')}</select>
                             </label>
                         </div>
                     ` : ''}
@@ -1988,6 +2015,11 @@ export function createForgeController(deps) {
                             </div>
                         </div>
 
+                        <div class="pcx-preset-active-bar">
+                            <strong>${tUi(uiLang, 'Выбран шаблон:', 'Selected preset:')} «${escapeHtml(uiLang === 'en' ? (activePreset.nameEn || activePreset.name) : activePreset.name)}»</strong>
+                            <small>${escapeHtml(activePreset.placeholder || '')} ${tUi(uiLang, '(Поле пожеланий ниже необязательно — можно запускать сразу по контексту чата или вписать свои уточнения).', '(Wish box below is optional — run immediately from chat context or add custom details).')}</small>
+                        </div>
+
                         ${activePreset.isCustom ? `
                             <div class="pcx-actions pcx-between pcx-surface" style="padding:8px 11px;background:var(--paper);">
                                 <small>${tUi(uiLang, 'Ваш пресет:', 'Custom preset:')} <strong>«${escapeHtml(activePreset.name)}»</strong></small>
@@ -2044,7 +2076,7 @@ export function createForgeController(deps) {
                                     </label>
                                     <label class="pcx-field">
                                         <span>${tUi(uiLang, 'Целевой язык', 'Language')}</span>
-                                        <input type="text" id="pcx-fgp-lang" class="pcx-input" value="${escapeHtml(s.aiLang || 'Русский')}">
+                                        <select id="pcx-fgp-lang" class="pcx-input">${LANGUAGES.map(l => `<option value="${escapeHtml(l.id)}" ${s.aiLang === l.id ? 'selected' : ''}>${escapeHtml(l.label)}</option>`).join('')}</select>
                                     </label>
                                 </div>
                                 <div class="pcx-chk-row">
@@ -2364,7 +2396,7 @@ export function createForgeController(deps) {
             <div class="pcx-page-head">
                 <div>
                     <h1>${tUi(uiLang, 'Кузница Лорбуков', 'Lorebook Forge')}</h1>
-                    <p>${tUi(uiLang, 'Управляйте привязкой каждого тома прямо с обложки (Чат / Глобально / Персонаж), меняйте обложки и куйте новые миры без риска затереть живые записи.', 'Toggle Chat, Global, and Character bindings directly on each cover, attach lossless cover art, or forge new worlds.')}</p>
+                    
                 </div>
                 <div class="pcx-actions">
                     <button type="button" class="pcx-btn pcx-btn-secondary" id="pcx-fg-new-manual-btn">+ ${tUi(uiLang, 'Пустой том', 'Blank Tome')}</button>
@@ -2470,7 +2502,7 @@ export function createForgeController(deps) {
 
     function bindForgeEvents(win) {
         const s = ensureSettings();
-        const goShelf = () => { state.screen = 'shelf'; fetchBooksList().then(() => requestRender()); };
+        const goShelf = () => { state.screen = 'shelf'; requestRender(); fetchBooksList().then(() => { if (state.screen === 'shelf') requestRender({ preserveBodyScroll: true }); }); };
         win.querySelector('#pcx-fg-back-shelf')?.addEventListener('click', goShelf);
         win.querySelector('#pcx-fg-back-shelf-2')?.addEventListener('click', goShelf);
 
@@ -3240,7 +3272,7 @@ export function createForgeController(deps) {
     }
 
     return {
-        onEnterForge() { state.screen = 'shelf'; fetchBooksList().then(() => requestRender({ preserveBodyScroll: true })); },
+        onEnterForge() { state.screen = 'shelf'; fetchBooksList().then(() => { if (state.screen === 'shelf') requestRender({ preserveBodyScroll: true }); }); },
         ensureBooksLoadedQuietly() { if (!state.books.length && !state.loading) fetchBooksList().catch(() => {}); },
         getShelfSnapshot() {
             return state.books.map(b => ({
@@ -3265,7 +3297,7 @@ export function createForgeController(deps) {
             state.screen = 'book_entries';
             requestRender();
         },
-        onEnterForgeHub() { state.screen = 'create_hub'; fetchBooksList().then(() => requestRender()); },
+        onEnterForgeHub() { state.screen = 'create_hub'; fetchBooksList().then(() => { if (state.screen === 'create_hub') requestRender({ preserveBodyScroll: true }); }); },
         onExternalWorldInfoUpdated(bookName, bookData) {
             if (!bookName || stApi.isOwnWorldInfoSave?.(bookData)) return false;
             let changed = false;
