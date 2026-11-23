@@ -1,4 +1,5 @@
-import { ICONS, LANGUAGES } from './themes_and_icons.js';
+import { ICONS, LANGUAGES, renderProceduralCoverSvg } from './themes_and_icons.js';
+import { executePcxAiRequest, toBlobDisplayUrl, readImageFileLossless } from './ai_engine.js';
 import {
     FORGE_BOOK_PRESETS,
     formatCleanParagraphs,
@@ -249,6 +250,7 @@ export function createForgeController(deps) {
 
         // Single-page editor (manual + AI co-author with presets & word limits)
         entrySessionId: 0,
+        entryTracker: null,
         entryCreatedUid: null,
         entrySavingBusy: false,
         editingUid: null,
@@ -339,25 +341,26 @@ export function createForgeController(deps) {
         return s.collapsedForgeEntries[bookId];
     }
 
+    function getAllForgeBookPresets() {
+        const s = ensureSettings();
+        const custom = Array.isArray(s.customForgePresets)
+            ? s.customForgePresets.filter(p => p && p.id && p.name).map(p => ({ ...p, isCustom: true }))
+            : [];
+        return [...FORGE_BOOK_PRESETS, ...custom];
+    }
+
     function getActiveForgeBookPreset() {
         const s = ensureSettings();
-        return FORGE_BOOK_PRESETS.find(p => p.id === s.forgePresetId) || FORGE_BOOK_PRESETS[0];
+        const all = getAllForgeBookPresets();
+        return all.find(p => p.id === s.forgePresetId) || all[0];
     }
 
     async function callForgeModel(systemPrompt, userPrompt, schemaObj, maxTokens = 3800) {
         const s = ensureSettings();
         const uiLang = s.uiLang || 'ru';
         const profileId = (s.aiProfileId || '').trim();
-        const service = stApi.connectionService;
-
+        let profileLabel = tUi(uiLang, '[ Текущее подключение SillyTavern ]', '[ Current SillyTavern Connection ]');
         if (profileId) {
-            if (!service || typeof service.sendRequest !== 'function') {
-                throw new Error(tUi(
-                    uiLang,
-                    'Сервис профилей подключения SillyTavern недоступен. Выберите «[ Текущее подключение ]» или включите Connection Manager.',
-                    'SillyTavern Connection Manager is unavailable. Select "[ Current Connection ]" or enable Connection Manager.',
-                ));
-            }
             const chosen = getConnectionProfiles().find(p => p.id === profileId);
             if (!chosen) {
                 throw new Error(tUi(
@@ -366,31 +369,17 @@ export function createForgeController(deps) {
                     'The selected AI Connection Profile no longer exists. Please choose another profile.',
                 ));
             }
-            const isTc = chosen.mode === 'tc';
-            const payload = isTc
-                ? `${systemPrompt}\n\n${userPrompt}`
-                : [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }];
-            if (isTc || !schemaObj) {
-                return await service.sendRequest(
-                    profileId, payload, maxTokens,
-                    { stream: false, extractData: true, includePreset: false, includeInstruct: false },
-                );
-            }
-            try {
-                return await service.sendRequest(
-                    profileId, payload, maxTokens,
-                    { stream: false, extractData: true, includePreset: false, includeInstruct: false },
-                    { json_schema: schemaObj },
-                );
-            } catch (err) {
-                if (!isSchemaUnsupportedError(err)) throw err;
-                return await service.sendRequest(
-                    profileId, payload, maxTokens,
-                    { stream: false, extractData: true, includePreset: false, includeInstruct: false },
-                );
-            }
+            profileLabel = chosen.name || profileId;
         }
-        return await stApi.generateWithSchemaFallback(systemPrompt, userPrompt, schemaObj);
+        return await executePcxAiRequest({
+            stApi,
+            settings: { ...s, aiMaxTokens: maxTokens },
+            profileId,
+            profileLabel,
+            systemPrompt,
+            userPrompt,
+            jsonSchema: schemaObj,
+        });
     }
 
     function parseJsonObjectFromModel(raw, expectedKind = 'any') {
@@ -428,11 +417,11 @@ export function createForgeController(deps) {
         const missing = (booksList || []).filter(b => state.bookCounts[b.file_id] === undefined);
         if (!missing.length) return;
         hydratingCounts = true;
+        let anyChanged = false;
         try {
             const chunkSize = 6;
             for (let i = 0; i < missing.length; i += chunkSize) {
                 const batch = missing.slice(i, i + chunkSize);
-                let changed = false;
                 await Promise.all(batch.map(async (b) => {
                     try {
                         const data = await loadBookData(b.file_id);
@@ -442,10 +431,15 @@ export function createForgeController(deps) {
                             b.extensions = b.extensions || {};
                             b.extensions.pocket_codex_cover = safeCover;
                         }
-                        changed = true;
+                        anyChanged = true;
                     } catch {}
                 }));
-                if (changed && state.screen === 'shelf') requestRender({ preserveBodyScroll: true });
+            }
+            if (anyChanged && state.screen === 'shelf') {
+                const activeEl = document.activeElement;
+                if (!activeEl || activeEl.id !== 'pcx-fg-shelf-search') {
+                    requestRender({ preserveBodyScroll: true });
+                }
             }
         } finally {
             hydratingCounts = false;
@@ -694,7 +688,13 @@ export function createForgeController(deps) {
         return { live: false, inLastPrompt: false, hitKeys: [], label: tUi(uiLang, `Спит — ждёт ключ в последних ${depth} сообщ.`, `Idle — waiting for key in last ${depth} msgs`) };
     }
 
-    function renderBindPills(fileId) {
+    function isMemoryBooksEntry(ent) {
+        if (!ent || typeof ent !== 'object') return false;
+        if (ent.stmemorybooks === true || ent.STMB_chatId || ent.STMB_canonicalLorebook) return true;
+        return /^\[?\s*memory\s*#?\d+/i.test(String(ent.comment || ''));
+    }
+
+    function renderBindPills(fileId, { inlineMode = false } = {}) {
         const uiLang = ensureSettings().uiLang || 'ru';
         const globals = stApi.getGlobalLorebooks?.() || [];
         const isGlob = globals.includes(fileId);
@@ -702,19 +702,168 @@ export function createForgeController(deps) {
         const isChar = stApi.getCharLorebook?.() === fileId;
         const chatOpen = stApi.isChatOpen();
         const charOpen = isSingleCharOpen();
+        const mb = stApi.getMemoryBooksStatus?.() || { installed: false, enabled: false, targetBook: '', mode: 'chat' };
+        const isMbTarget = Boolean(mb.installed && mb.enabled && mb.targetBook && mb.targetBook === fileId);
+        const mbTitle = mb.mode === 'lock'
+            ? tUi(uiLang, 'Книга закреплена замком персонажа в настройках Memory Books', 'Locked to character inside Memory Books settings')
+            : tUi(uiLang, 'Назначить этот Лорбук приёмником воспоминаний Memory Books в текущем чате', 'Route Memory Books memories into this Lorebook for the active chat');
+
+        if (inlineMode) {
+            return `
+                <div class="pcx-actions">
+                    <button type="button" class="pcx-chip ${isChat ? 'pcx-active' : ''}" data-fg-scope="chat" data-fg-book="${escapeHtml(fileId)}" ${!chatOpen ? 'disabled' : ''}>${tUi(uiLang, 'Чат', 'Chat')}</button>
+                    <button type="button" class="pcx-chip ${isGlob ? 'pcx-active' : ''}" data-fg-scope="global" data-fg-book="${escapeHtml(fileId)}">${tUi(uiLang, 'Глобально', 'Global')}</button>
+                    <button type="button" class="pcx-chip ${isChar ? 'pcx-active' : ''}" data-fg-scope="char" data-fg-book="${escapeHtml(fileId)}" ${!charOpen ? 'disabled' : ''}>${tUi(uiLang, 'Персонаж', 'Char')}</button>
+                    ${mb.installed ? `<button type="button" class="pcx-chip ${isMbTarget ? 'pcx-active' : ''}" data-fg-scope="memory" data-fg-book="${escapeHtml(fileId)}" ${(!chatOpen || !mb.enabled) ? 'disabled' : ''} title="${escapeHtml(mbTitle)}">${ICONS.memory}<span>Memory Books</span></button>` : ''}
+                </div>`;
+        }
 
         return `
-            <div class="pcx-bind-strip">
-                <button type="button" class="pcx-bind-pill ${isGlob ? 'pcx-on' : ''}" data-fg-scope="global" data-fg-book="${escapeHtml(fileId)}" title="${tUi(uiLang, 'Включить глобально в меню Мира Таверны', 'Toggle Global Lorebook in ST')}">
-                    ${ICONS.globe}<span>${tUi(uiLang, 'Глобально', 'Global')}</span>
-                </button>
-                <button type="button" class="pcx-bind-pill ${isChat ? 'pcx-on' : ''}" data-fg-scope="chat" data-fg-book="${escapeHtml(fileId)}" ${!chatOpen ? 'disabled' : ''} title="${tUi(uiLang, 'Привязать только к текущему открытому чату', 'Bind to current chat')}">
-                    ${ICONS.chat}<span>${tUi(uiLang, 'В чат', 'Chat')}</span>
-                </button>
-                <button type="button" class="pcx-bind-pill ${isChar ? 'pcx-on' : ''}" data-fg-scope="char" data-fg-book="${escapeHtml(fileId)}" ${!charOpen ? 'disabled' : ''} title="${tUi(uiLang, 'Закрепить за карточкой текущего персонажа', 'Bind to character card')}">
-                    ${ICONS.user}<span>${tUi(uiLang, 'Персонаж', 'Char')}</span>
-                </button>
-            </div>`;
+            <div class="pcx-bind-strip" title="${tUi(uiLang, 'Независимые области привязки книги', 'Independent Lorebook binding scopes')}">
+                <button type="button" class="pcx-bind-pill ${isChat ? 'pcx-on' : ''}" data-fg-scope="chat" data-fg-book="${escapeHtml(fileId)}" ${!chatOpen ? 'disabled' : ''} title="${tUi(uiLang, 'Привязать к текущему чату (поддерживается несколько книг)', 'Bind to current chat')}">${tUi(uiLang, 'Чат', 'Chat')}</button>
+                <button type="button" class="pcx-bind-pill ${isGlob ? 'pcx-on' : ''}" data-fg-scope="global" data-fg-book="${escapeHtml(fileId)}" title="${tUi(uiLang, 'Включить глобально в меню Мира Таверны', 'Toggle Global Lorebook')}">${tUi(uiLang, 'Глоб.', 'Global')}</button>
+                <button type="button" class="pcx-bind-pill ${isChar ? 'pcx-on' : ''}" data-fg-scope="char" data-fg-book="${escapeHtml(fileId)}" ${!charOpen ? 'disabled' : ''} title="${tUi(uiLang, 'Привязать как основной Лорбук персонажа', 'Bind to character card')}">${tUi(uiLang, 'Чар', 'Char')}</button>
+            </div>
+            ${mb.installed ? `<div class="pcx-mb-pill-row"><button type="button" class="pcx-bind-pill ${isMbTarget ? 'pcx-on' : ''}" data-fg-scope="memory" data-fg-book="${escapeHtml(fileId)}" ${(!chatOpen || !mb.enabled) ? 'disabled' : ''} title="${escapeHtml(mbTitle)}">${ICONS.memory}<span>${isMbTarget ? tUi(uiLang, 'Приёмник Memory Books', 'Memory Books Target') : 'Memory Books'}</span></button></div>` : ''}`;
+    }
+
+    function isSingleCharOpen() {
+        const c = stApi.ctx;
+        return Boolean(!c.groupId && c.characterId !== undefined && c.characterId !== null && c.characterId !== '');
+    }
+
+    function captureContextAnchor() {
+        const c = stApi.ctx || {};
+        const chatId = String(c.getCurrentChatId?.() ?? c.chatId ?? '');
+        const charId = c.characterId !== undefined && c.characterId !== null ? String(c.characterId) : '';
+        const groupId = c.groupId ? String(c.groupId) : '';
+        const chatMetaRef = stApi.chatMetadata || null;
+        const storeRef = typeof getActiveStore === 'function' ? getActiveStore() : null;
+        return {
+            isChatOpen: Boolean(stApi.isChatOpen()),
+            chatId,
+            charId,
+            groupId,
+            chatMetaRef,
+            storeRef,
+        };
+    }
+
+    function isSameContextAnchor(anchor) {
+        if (!anchor) return true;
+        const now = captureContextAnchor();
+        if (anchor.isChatOpen !== now.isChatOpen) return false;
+        if (anchor.chatId !== now.chatId) return false;
+        if (anchor.charId !== now.charId) return false;
+        if (anchor.groupId !== now.groupId) return false;
+        if (anchor.chatMetaRef && now.chatMetaRef && anchor.chatMetaRef !== now.chatMetaRef) return false;
+        if (anchor.storeRef && now.storeRef && anchor.storeRef !== now.storeRef) return false;
+        return true;
+    }
+
+    async function applyBindingScope(fileId, scope, expectedAnchor = null) {
+        if (!fileId || scope === 'none') return true;
+        if (expectedAnchor && (scope === 'chat' || scope === 'char') && !isSameContextAnchor(expectedAnchor)) {
+            return false;
+        }
+        if (scope === 'global') {
+            const globals = stApi.getGlobalLorebooks?.() || [];
+            if (!globals.includes(fileId)) await stApi.toggleGlobalLorebook?.(fileId);
+        } else if (scope === 'chat') {
+            if (!getChatBoundBooks().includes(fileId)) {
+                await toggleBindBookToChat(fileId);
+            }
+        } else if (scope === 'char') {
+            if (isSingleCharOpen() && stApi.getCharLorebook?.() !== fileId) {
+                await stApi.toggleCharLorebook?.(fileId);
+            }
+        }
+        return true;
+    }
+
+    function scanEntryAgainstRecentChat(ent, bookId = state.activeBookId) {
+        const uiLang = ensureSettings().uiLang || 'ru';
+        const inLastPrompt = Boolean(bookId && stApi.wasWiEntryActivated?.(bookId, ent.uid));
+        if (ent.disable) return { live: false, inLastPrompt: false, hitKeys: [], label: tUi(uiLang, 'Страница выключена тумблером', 'Muted via toggle') };
+        if (ent.constant) {
+            return {
+                live: true,
+                inLastPrompt,
+                hitKeys: [],
+                label: inLastPrompt
+                    ? tUi(uiLang, 'Постоянно • Попала в последний промпт', 'Constant • Sent in last prompt')
+                    : tUi(uiLang, 'Постоянно: всегда готова к отправке', 'Constant: always active when book is bound'),
+            };
+        }
+        if (ent.vectorized && (!Array.isArray(ent.key) || ent.key.length === 0)) {
+            return {
+                live: inLastPrompt,
+                inLastPrompt,
+                hitKeys: [],
+                label: inLastPrompt
+                    ? tUi(uiLang, 'Вектор • Попала в последний промпт', 'Vector • Sent in last prompt')
+                    : tUi(uiLang, 'Вектор: активируется по смыслу (Vector Storage)', 'Vector: activates via semantic similarity'),
+            };
+        }
+        const keys = Array.isArray(ent.key) ? ent.key.map(k => String(k).trim()).filter(Boolean) : [];
+        if (!keys.length) return { live: false, inLastPrompt: false, hitKeys: [], label: tUi(uiLang, 'Нет ключевых слов — добавь ключи или выбери «Постоянно»', 'No trigger keys — add keys or switch to Constant') };
+        if (!stApi.isChatOpen()) return { live: false, inLastPrompt: false, hitKeys: [], label: tUi(uiLang, 'Ждёт упоминания ключей в чате', 'Waiting for trigger keys in chat') };
+
+        const wiMod = stApi.worldInfoMod;
+        const depth = Math.max(1, Number(ent.scanDepth ?? wiMod?.world_info_depth ?? 2) || 2);
+        const includeNames = wiMod?.world_info_include_names !== false;
+        const wholeWords = (ent.matchWholeWords !== null && ent.matchWholeWords !== undefined)
+            ? Boolean(ent.matchWholeWords)
+            : (wiMod?.world_info_match_whole_words !== undefined ? Boolean(wiMod.world_info_match_whole_words) : true);
+        const caseSens = (ent.caseSensitive !== null && ent.caseSensitive !== undefined)
+            ? Boolean(ent.caseSensitive)
+            : Boolean(wiMod?.world_info_case_sensitive);
+
+        const chatArr = Array.isArray(stApi.ctx?.chat) ? stApi.ctx.chat : [];
+        const recent = chatArr.filter(m => m && !m.is_system && typeof m.mes === 'string').slice(-depth);
+        if (!recent.length) return { live: inLastPrompt, inLastPrompt, hitKeys: [], label: tUi(uiLang, `Спит (сканирует последние ${depth} сообщ.)`, `Idle (scans last ${depth} msgs)`) };
+
+        const rawHaystack = recent.map(m => includeNames && m.name ? `${m.name}: ${m.mes}` : m.mes).join('\n');
+        const lowHaystack = rawHaystack.toLowerCase();
+        const participantNames = [stApi.ctx?.name1, stApi.ctx?.name2].filter(Boolean).map(n => String(n).toLowerCase());
+        const hitKeys = [];
+        let matchedParticipantName = false;
+
+        for (const k of keys) {
+            if (matchTriggerKeyInText(lowHaystack, rawHaystack, k, wholeWords, caseSens)) {
+                hitKeys.push(k);
+                if (includeNames && participantNames.includes(k.toLowerCase())) matchedParticipantName = true;
+            }
+        }
+
+        const secOk = checkEntrySecondaryKeysInText(lowHaystack, rawHaystack, ent, wholeWords, caseSens);
+        if (hitKeys.length > 0 && secOk) {
+            const warnName = matchedParticipantName ? tUi(uiLang, ' (имя участника чата)', ' (matches participant name)') : '';
+            const prefix = inLastPrompt
+                ? tUi(uiLang, 'В последнем промпте • ключ: ', 'In last prompt • key: ')
+                : tUi(uiLang, 'Ключ замечен в чате: ', 'Key noticed in chat: ');
+            return {
+                live: true,
+                inLastPrompt,
+                hitKeys,
+                label: `${prefix}${hitKeys.slice(0, 3).join(', ')}${warnName}`,
+            };
+        }
+        if (inLastPrompt) {
+            return {
+                live: true,
+                inLastPrompt: true,
+                hitKeys,
+                label: tUi(uiLang, 'Попала в последний промпт (по рекурсии / sticky)', 'Sent in last prompt (via recursion / sticky)'),
+            };
+        }
+        return { live: false, inLastPrompt: false, hitKeys: [], label: tUi(uiLang, `Спит — ждёт ключ в последних ${depth} сообщ.`, `Idle — waiting for key in last ${depth} msgs`) };
+    }
+
+    function isMemoryBooksEntry(ent) {
+        if (!ent || typeof ent !== 'object') return false;
+        if (ent.stmemorybooks === true || ent.STMB_chatId || ent.STMB_canonicalLorebook) return true;
+        return /^\[?\s*memory\s*#?\d+/i.test(String(ent.comment || ''));
     }
 
     function openEntryEditor({ bookId, uid = null, initialTab = 'manual', bookData = null }) {
@@ -725,6 +874,13 @@ export function createForgeController(deps) {
         state.entrySavingBusy = false;
         state.pageAiGenerating = false;
         state.keysGenerating = false;
+        state.entryTracker = {
+            sessionId: state.entrySessionId,
+            targetBookId: resolvedBookId,
+            allocatedUid: uid !== null && uid !== undefined ? String(uid) : null,
+            directSaveInFlight: false,
+            manualCommitted: false,
+        };
         state.entryTargetBookId = resolvedBookId;
         state.editingOriginBookId = uid !== null ? resolvedBookId : '';
         state.editingUid = uid;
@@ -755,18 +911,22 @@ export function createForgeController(deps) {
 
     async function saveDraftToTargetBook(draftObj, explicitCtx = null) {
         const isBackgroundPinned = Boolean(explicitCtx);
+        const tracker = isBackgroundPinned ? (explicitCtx.tracker || null) : (state.entryTracker || null);
+
         if (!isBackgroundPinned) {
-            if (state.entrySavingBusy) return false;
+            if (state.entrySavingBusy || tracker?.directSaveInFlight) return false;
             state.entrySavingBusy = true;
+        } else if (tracker?.manualCommitted) {
+            return false;
         }
 
-        const effectiveUid = isBackgroundPinned
-            ? explicitCtx.editingUid
-            : (state.editingUid !== null ? state.editingUid : state.entryCreatedUid);
-        const isEditingExisting = effectiveUid !== null && effectiveUid !== undefined;
+        const initialUid = isBackgroundPinned
+            ? (tracker?.allocatedUid ?? explicitCtx.editingUid)
+            : (state.editingUid !== null ? state.editingUid : (tracker?.allocatedUid ?? state.entryCreatedUid));
+        const hasInitialUid = initialUid !== null && initialUid !== undefined;
         const targetBookId = isBackgroundPinned
             ? explicitCtx.targetBookId
-            : (isEditingExisting
+            : (hasInitialUid
                 ? (state.editingOriginBookId || state.entryTargetBookId || state.activeBookId)
                 : (state.entryTargetBookId || state.activeBookId));
 
@@ -790,9 +950,17 @@ export function createForgeController(deps) {
         let createdUidStr = null;
 
         try {
-            const editUidStr = String(effectiveUid);
             const savedBook = await mutateBookAtomically(targetBookId, (freshBook) => {
+                if (isBackgroundPinned && tracker?.manualCommitted) {
+                    return;
+                }
                 const entries = freshBook.entries;
+                const resolvedUid = (tracker && tracker.allocatedUid !== null && tracker.allocatedUid !== undefined)
+                    ? tracker.allocatedUid
+                    : initialUid;
+                const isEditingExisting = resolvedUid !== null && resolvedUid !== undefined;
+                const editUidStr = String(resolvedUid);
+
                 if (isEditingExisting) {
                     if (!Object.prototype.hasOwnProperty.call(entries, editUidStr) || !entries[editUidStr]) {
                         throw new Error(tUi(
@@ -858,9 +1026,17 @@ export function createForgeController(deps) {
                     const uids = Object.keys(entries).map(Number).filter(n => !Number.isNaN(n));
                     const nextUid = uids.length > 0 ? (Math.max(...uids) + 1) : 0;
                     createdUidStr = String(nextUid);
+                    if (tracker) {
+                        tracker.allocatedUid = createdUidStr;
+                        if (!isBackgroundPinned) tracker.manualCommitted = true;
+                    }
                     entries[createdUidStr] = makeStandardWiEntry(nextUid, { ...cleanDraft, keys: parsedNewKeys }, stApi.worldInfoMod?.newWorldInfoEntryTemplate);
                 }
             });
+
+            if (!isBackgroundPinned && tracker) {
+                tracker.manualCommitted = true;
+            }
 
             state.bookCounts[targetBookId] = Object.keys(savedBook.entries || {}).length;
 
@@ -982,12 +1158,17 @@ export function createForgeController(deps) {
         const usePersonaAtStart = state.pageAiUsePersona;
         const useChatAtStart = state.pageAiUseChat;
 
-        const pinnedEditingUid = state.editingUid !== null ? state.editingUid : state.entryCreatedUid;
+        const trackerAtStart = state.entryTracker;
+        const pinnedEditingUid = state.editingUid !== null ? state.editingUid : (trackerAtStart?.allocatedUid ?? state.entryCreatedUid);
         const pinnedTargetBookId = pinnedEditingUid !== null
             ? (state.editingOriginBookId || state.entryTargetBookId || state.activeBookId)
             : (state.entryTargetBookId || state.activeBookId);
+        if (directSave && trackerAtStart) {
+            trackerAtStart.directSaveInFlight = true;
+        }
         const pinnedSaveCtx = {
             sessionId: sessionAtStart,
+            tracker: trackerAtStart,
             editingUid: pinnedEditingUid,
             targetBookId: pinnedTargetBookId,
             baseSnapshot: state.entryBaseSnapshot ? JSON.parse(JSON.stringify(state.entryBaseSnapshot)) : null,
@@ -1092,6 +1273,9 @@ export function createForgeController(deps) {
                 state.pageAiStatus = 'Ошибка: ' + (err?.message || String(err));
             }
         } finally {
+            if (directSave && trackerAtStart) {
+                trackerAtStart.directSaveInFlight = false;
+            }
             if (state.entrySessionId === sessionAtStart) {
                 state.pageAiGenerating = false;
                 requestRender({ preserveBodyScroll: true });
@@ -1432,6 +1616,7 @@ export function createForgeController(deps) {
             state.saveError = postSaveNotice;
             state.wizStatus = postSaveNotice;
             state.screen = 'book_entries';
+            state.commitSavingBusy = false;
             requestRender();
             return true;
         } catch (err) {
@@ -1441,6 +1626,7 @@ export function createForgeController(deps) {
             if (state.stagedEntries.length > 0) {
                 state.screen = 'approve';
             }
+            state.commitSavingBusy = false;
             try { window.toastr?.error?.(msg); } catch {}
             window.alert(msg);
             requestRender({ preserveBodyScroll: true });
@@ -1448,6 +1634,20 @@ export function createForgeController(deps) {
         } finally {
             state.commitSavingBusy = false;
         }
+    }
+
+    function renderBookCoverGraphic(bookId, bookName, rawCover, countNum, uiLang) {
+        const safeCover = sanitizeCoverDataUrl(rawCover);
+        if (safeCover) {
+            return `<img class="pcx-cover-img" src="${escapeHtml(toBlobDisplayUrl(safeCover))}" alt="${escapeHtml(bookName)}">`;
+        }
+        const cntText = countNum !== undefined ? `${countNum} PAGES` : '';
+        return renderProceduralCoverSvg({
+            title: bookName || bookId,
+            subtitle: uiLang === 'en' ? 'FORGE' : 'FORGE',
+            countLabel: cntText,
+            seed: bookId || bookName,
+        });
     }
 
     function renderForgeBody() {
@@ -1459,547 +1659,659 @@ export function createForgeController(deps) {
         const store = getActiveStore();
         const profiles = getConnectionProfiles();
         const activePreset = getActiveForgeBookPreset();
+        const allForgePresets = getAllForgeBookPresets();
+        const mbStatus = stApi.getMemoryBooksStatus?.() || { installed: false, enabled: false, targetBook: '', mode: 'chat' };
+        const aiModeShort = s.aiTransportMode === 'direct'
+            ? tUi(uiLang, 'Режим ИИ: JSON-схема', 'AI Mode: JSON Schema')
+            : tUi(uiLang, 'Режим ИИ: Через пресет Таверны', 'AI Mode: Tavern Preset');
 
+        // 1. CREATE HUB (1:1 Concept renderForgeHub)
         if (state.screen === 'create_hub') {
             const hasBooks = state.books.length > 0;
             return `
-                <div class="pcx-panel-box">
-                    <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
-                        <span style="font-size:14.5px;font-weight:800;">${tUi(uiLang, 'Что создать в Кузнице?', 'What would you like to forge?')}</span>
-                        <button type="button" class="pcx-mini-btn" id="pcx-fg-back-shelf">${ICONS.chevLeft}<span>${tUi(uiLang, 'К полке', 'Shelf')}</span></button>
-                    </div>
-                    <div class="pcx-hub-grid">
-                        <button type="button" class="pcx-hub-card" id="pcx-hub-whole-ai">
-                            <div class="pcx-hub-card-head">${ICONS.forge}<span>${tUi(uiLang, 'Целый Лорбук с ИИ', 'Full Lorebook with AI')}</span></div>
-                            <div class="pcx-hub-card-desc">${tUi(uiLang, 'Придумать новые страницы мира с ключами по теме, сеттингу и выбранному пресету.', 'Generate world pages & keys from a theme, setting, or preset.')}</div>
-                        </button>
-                        <button type="button" class="pcx-hub-card" id="pcx-hub-whole-manual">
-                            <div class="pcx-hub-card-head">${ICONS.book}<span>${tUi(uiLang, 'Пустой Лорбук вручную', 'Empty Lorebook Manually')}</span></div>
-                            <div class="pcx-hub-card-desc">${tUi(uiLang, 'Создать чистый том с обложкой, выбрать область работы и наполнять страницами.', 'Create a blank tome with cover art and scope binding.')}</div>
-                        </button>
-                        <button type="button" class="pcx-hub-card" id="pcx-hub-page-ai" ${!hasBooks ? 'disabled style="opacity:0.45;cursor:not-allowed"' : ''}>
-                            <div class="pcx-hub-card-head">${ICONS.spark}<span>${tUi(uiLang, 'Отдельную страницу с ИИ', 'Single Page with AI')}</span></div>
-                            <div class="pcx-hub-card-desc">${hasBooks ? tUi(uiLang, 'Добавить свежую статью (локацию, NPC, реликвию, закон мира) в любой существующий Лорбук.', 'Forge a single lore page into any existing Lorebook.') : tUi(uiLang, 'Сначала создай хотя бы один Лорбук.', 'Create at least one Lorebook first.')}</div>
-                        </button>
-                        <button type="button" class="pcx-hub-card" id="pcx-hub-page-manual" ${!hasBooks ? 'disabled style="opacity:0.45;cursor:not-allowed"' : ''}>
-                            <div class="pcx-hub-card-head">${ICONS.edit}<span>${tUi(uiLang, 'Отдельную страницу вручную', 'Single Page Manually')}</span></div>
-                            <div class="pcx-hub-card-desc">${hasBooks ? tUi(uiLang, 'Написать страницу самому для любой книги (ключи можно ввести или подобрать кнопкой ИИ).', 'Write a page manually with optional AI key generation.') : tUi(uiLang, 'Сначала создай хотя бы один Лорбук.', 'Create at least one Lorebook first.')}</div>
-                        </button>
-                    </div>
-                </div>`;
-        }
-
-        if (state.screen === 'new_book') {
-            return `
-                <div class="pcx-panel-box">
-                    <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
-                        <span style="font-size:14.5px;font-weight:800;">${tUi(uiLang, 'Новый Лорбук', 'New Lorebook')}</span>
-                        <button type="button" class="pcx-mini-btn" id="pcx-fg-back-shelf">${ICONS.chevLeft}<span>${tUi(uiLang, 'К полке', 'Shelf')}</span></button>
-                    </div>
-                    ${state.saveError ? `<div class="pcx-err-banner"><span>${escapeHtml(state.saveError)}</span></div>` : ''}
-                    <div><label class="pcx-field-label">${tUi(uiLang, 'Название Лорбука', 'Lorebook Name')}</label><input id="pcx-fg-newname" class="pcx-input" placeholder="${tUi(uiLang, 'Например: Хроники Кракоа / Мир Ведьмака', 'e.g. Chronicles of Krakoa')}" value="${escapeHtml(state.newBookName)}"></div>
+                <button type="button" class="pcx-back-link" id="pcx-fg-back-shelf">${ICONS.chevLeft}<span>${tUi(uiLang, 'Назад на Полку Кузницы', 'Back to Forge Shelf')}</span></button>
+                <div class="pcx-page-head">
                     <div>
-                        <label class="pcx-field-label">${tUi(uiLang, 'Куда сразу подключить?', 'Initial Binding Scope')} ${renderHelpBtn('forge_scope')}</label>
-                        ${renderHelpBubble('forge_scope')}
-                        <select id="pcx-fg-newscope" class="pcx-select">
-                            <option value="global" ${state.newBookBindScope === 'global' ? 'selected' : ''}>${tUi(uiLang, 'Глобально (в верхнем меню Мира Таверны)', 'Global (in ST World Info menu)')}</option>
-                            ${stApi.isChatOpen() ? `<option value="chat" ${state.newBookBindScope === 'chat' ? 'selected' : ''}>${tUi(uiLang, 'Только в текущий чат', 'Current Chat Only')}</option>` : ''}
-                            ${isSingleCharOpen() ? `<option value="char" ${state.newBookBindScope === 'char' ? 'selected' : ''}>${tUi(uiLang, 'К карточке текущего персонажа', 'Current Character Card')}</option>` : ''}
-                            <option value="none" ${state.newBookBindScope === 'none' ? 'selected' : ''}>${tUi(uiLang, 'Пока не подключать', 'Leave unbound on shelf')}</option>
-                        </select>
+                        <h1>${tUi(uiLang, 'Что выковать в Кузнице?', 'What would you like to forge?')}</h1>
+                        <p>${tUi(uiLang, 'Выберите создание целого тома или отдельной страницы — с помощью Соавтора ИИ или полностью вручную.', 'Choose between forging a complete Lorebook tome or a single page — with AI or manually.')}</p>
                     </div>
-                    <div style="display:flex;align-items:center;gap:12px;">
-                        <div class="pcx-book-cover" id="pcx-fg-newcover-pick">${sanitizeCoverDataUrl(state.newBookCover) ? `<img src="${escapeHtml(sanitizeCoverDataUrl(state.newBookCover))}">` : `${ICONS.image}<span class="pcx-cover-hint">ART</span>`}</div>
-                        <div style="display:flex;flex-direction:column;gap:6px;">
-                            <button type="button" class="pcx-mini-btn" id="pcx-fg-newcover-btn">${ICONS.clip}<span>${tUi(uiLang, 'Прикрепить Арт-обложку', 'Attach Cover Art')}</span></button>
-                            <input type="file" id="pcx-fg-newcover-input" accept="image/*" style="display:none">
+                </div>
+                <div class="pcx-hub-grid">
+                    <button type="button" class="pcx-hub-card" id="pcx-hub-whole-ai">
+                        <div class="pcx-hub-card-head"><span class="pcx-icon-tile pcx-warm">${ICONS.forge}</span><span>${tUi(uiLang, 'Целый Лорбук (Мастер Ковки)', 'Full Lorebook (Forge Wizard)')}</span></div>
+                        <small>${tUi(uiLang, 'Сгенерировать новые страницы мира по вашей теме и пресету, перенести заметки из Тетради или подобрать ИИ-ключи к вашему дословному тексту.', 'Generate world pages from your idea, transfer Notebook sections, or add AI keys to your verbatim text.')}</small>
+                    </button>
+                    <button type="button" class="pcx-hub-card" id="pcx-hub-whole-manual">
+                        <div class="pcx-hub-card-head"><span class="pcx-icon-tile">${ICONS.book}</span><span>${tUi(uiLang, 'Пустой Лорбук вручную', 'Blank Lorebook Manually')}</span></div>
+                        <small>${tUi(uiLang, 'Создать чистый том с арт-обложкой, сразу выбрать привязку (Чат / Глобально / К чару / На полке) и наполнять самому.', 'Create a clean tome with cover art and scope binding.')}</small>
+                    </button>
+                    <button type="button" class="pcx-hub-card" id="pcx-hub-page-ai" ${!hasBooks ? 'disabled' : ''}>
+                        <div class="pcx-hub-card-head"><span class="pcx-icon-tile pcx-warm">${ICONS.spark}</span><span>${tUi(uiLang, 'Отдельную страницу с ИИ', 'Single Page with AI')}</span></div>
+                        <small>${hasBooks ? tUi(uiLang, 'Добавить свежую локацию, NPC, фракцию или реликвию в любой существующий Лорбук по вашему запросу (со слепым скелетом формата).', 'Craft a new lore page into any existing Lorebook from your prompt.') : tUi(uiLang, 'Сначала создайте хотя бы один Лорбук.', 'Create at least one Lorebook first.')}</small>
+                    </button>
+                    <button type="button" class="pcx-hub-card" id="pcx-hub-page-manual" ${!hasBooks ? 'disabled' : ''}>
+                        <div class="pcx-hub-card-head"><span class="pcx-icon-tile">${ICONS.edit}</span><span>${tUi(uiLang, 'Отдельную страницу вручную', 'Single Page Manually')}</span></div>
+                        <small>${hasBooks ? tUi(uiLang, 'Написать статью самому на любую из 8 позиций World Info (включая глубину 0 и Outlet), а ключи ввести или подобрать кнопкой ИИ.', 'Write a page manually with optional 1-tap AI trigger key generation.') : tUi(uiLang, 'Сначала создайте хотя бы один Лорбук.', 'Create at least one Lorebook first.')}</small>
+                    </button>
+                </div>`;
+        }
+
+        // 2. NEW MANUAL BOOK (1:1 Concept renderForgeNewManualBook)
+        if (state.screen === 'new_book') {
+            const previewCover = sanitizeCoverDataUrl(state.newBookCover);
+            return `
+                <button type="button" class="pcx-back-link" id="pcx-fg-open-hub-btn">${ICONS.chevLeft}<span>${tUi(uiLang, 'Назад в выбор Кузницы', 'Back to Forge Hub')}</span></button>
+                <div class="pcx-surface pcx-panel pcx-stack">
+                    <h2>${tUi(uiLang, 'Новый пустой Лорбук', 'New Blank Lorebook')}</h2>
+                    ${state.saveError ? `<div class="pcx-guide-note" style="background:var(--danger-wash);color:var(--danger);">${escapeHtml(state.saveError)}</div>` : ''}
+                    <div class="pcx-pair">
+                        <label class="pcx-field">
+                            <span>${tUi(uiLang, 'Название Лорбука', 'Lorebook Name')}</span>
+                            <input type="text" id="pcx-fg-newname" class="pcx-input" placeholder="${tUi(uiLang, 'Например: Хроники Кракоа / Мир Ведьмака', 'e.g. Chronicles of Krakoa')}" value="${escapeHtml(state.newBookName)}">
+                        </label>
+                        <label class="pcx-field">
+                            <span>${tUi(uiLang, 'Куда сразу подключить?', 'Initial Binding Scope')} ${renderHelpBtn('forge_scope')}</span>
+                            <select id="pcx-fg-newscope" class="pcx-input">
+                                ${stApi.isChatOpen() ? `<option value="chat" ${state.newBookBindScope === 'chat' ? 'selected' : ''}>${tUi(uiLang, 'Только в текущий чат (доп. книга)', 'Current Chat Only')}</option>` : ''}
+                                <option value="global" ${state.newBookBindScope === 'global' ? 'selected' : ''}>${tUi(uiLang, 'Глобально (в меню Мира Таверны)', 'Global (ST World Info menu)')}</option>
+                                ${isSingleCharOpen() ? `<option value="char" ${state.newBookBindScope === 'char' ? 'selected' : ''}>${tUi(uiLang, 'К карточке текущего персонажа', 'Current Character Card')}</option>` : ''}
+                                <option value="none" ${state.newBookBindScope === 'none' ? 'selected' : ''}>${tUi(uiLang, 'Пока оставить свободным на полке', 'Leave unbound on shelf')}</option>
+                            </select>
+                        </label>
+                    </div>
+                    ${renderHelpBubble('forge_scope')}
+                    <div class="pcx-actions">
+                        <div id="pcx-fg-newcover-pick" style="width:72px;aspect-ratio:2/2.65;border-radius:8px;overflow:hidden;border:1px solid var(--line-strong);cursor:pointer;flex:none;">
+                            ${previewCover ? `<img src="${escapeHtml(toBlobDisplayUrl(previewCover))}" style="width:100%;height:100%;object-fit:cover;display:block;">` : renderProceduralCoverSvg({ title: state.newBookName || 'Tome', subtitle: 'FORGE', seed: state.newBookName || 'new' })}
                         </div>
+                        <button type="button" class="pcx-btn pcx-btn-secondary" id="pcx-fg-newcover-btn">${ICONS.image}<span>${previewCover ? tUi(uiLang, 'Сменить Арт-обложку', 'Change Cover Art') : tUi(uiLang, '+ Прикрепить Арт-обложку (без сжатия)', '+ Attach Cover Art (lossless)')}</span></button>
+                        <input type="file" id="pcx-fg-newcover-input" accept="image/*" hidden>
                     </div>
-                    <div style="display:flex;justify-content:flex-end;gap:8px;">
-                        <button type="button" class="pcx-icon-btn" id="pcx-fg-back-shelf-2">${tUi(uiLang, 'Отмена', 'Cancel')}</button>
-                        <button type="button" class="pcx-primary-btn" id="pcx-fg-create-manual-confirm">${ICONS.check}<span>${tUi(uiLang, 'Создать том', 'Create Tome')}</span></button>
+                    <div class="pcx-actions pcx-end">
+                        <button type="button" class="pcx-btn pcx-btn-secondary" id="pcx-fg-back-shelf-2">${tUi(uiLang, 'Отмена', 'Cancel')}</button>
+                        <button type="button" class="pcx-btn pcx-btn-primary" id="pcx-fg-create-manual-confirm">${ICONS.check}<span>${tUi(uiLang, 'Создать том', 'Create Tome')}</span></button>
                     </div>
                 </div>`;
         }
 
-        // FULL LOREBOOK WIZARD: With Presets, Word Count, Entry Count & Editable Prompt!
+        // 3. FULL LOREBOOK WIZARD (1:1 Concept renderForgeWizard + Custom Presets)
         if (state.screen === 'wizard') {
             const curBookPrompt = (s.forgeBookSystemPrompt && s.forgeBookSystemPrompt.trim()) ? s.forgeBookSystemPrompt : activePreset.bookPrompt;
             return `
-                <div class="pcx-panel-box">
-                    <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
-                        <span style="font-size:14.5px;font-weight:800;">${tUi(uiLang, 'Ковка Лорбука', 'Lorebook Forge Wizard')}</span>
-                        <button type="button" class="pcx-mini-btn" id="pcx-fg-back-shelf">${ICONS.chevLeft}<span>${tUi(uiLang, 'К полке', 'Shelf')}</span></button>
+                <button type="button" class="pcx-back-link" id="pcx-fg-open-hub-btn">${ICONS.chevLeft}<span>${tUi(uiLang, 'Назад в Кузницу', 'Back to Forge Hub')}</span></button>
+                <div class="pcx-surface pcx-panel pcx-stack">
+                    <div class="pcx-actions pcx-between">
+                        <h2>${tUi(uiLang, 'Мастер Ковки Лорбука', 'Lorebook Forge Wizard')}</h2>
+                        <button type="button" class="pcx-chip" data-open-settings-modal="1">${escapeHtml(aiModeShort)}</button>
                     </div>
-                    <div class="pcx-row-2">
-                        <div><label class="pcx-field-label">${tUi(uiLang, 'Куда сохранить?', 'Save Target')}</label>
-                        <select id="pcx-fg-target-mode" class="pcx-select">
-                            <option value="new" ${state.targetBookMode === 'new' ? 'selected' : ''}>${tUi(uiLang, 'Новый Лорбук', 'New Lorebook')}</option>
-                            ${state.books.length > 0 ? `<option value="existing" ${state.targetBookMode === 'existing' ? 'selected' : ''}>${tUi(uiLang, 'Дополнить существующий', 'Append to Existing')}</option>` : ''}
-                        </select></div>
-                        <div>${state.targetBookMode === 'existing'
-                            ? `<label class="pcx-field-label">${tUi(uiLang, 'Выбери книгу', 'Select Book')}</label><select id="pcx-fg-target-existing" class="pcx-select">${state.books.map(b => `<option value="${escapeHtml(b.file_id)}" ${b.file_id === state.targetExistingId ? 'selected' : ''}>${escapeHtml(b.name)}</option>`).join('')}</select>`
-                            : `<label class="pcx-field-label">${tUi(uiLang, 'Название книги', 'Book Name')}</label><input id="pcx-fg-target-name" class="pcx-input" placeholder="${tUi(uiLang, 'Например: Лор мира', 'e.g. World Lore')}" value="${escapeHtml(state.targetBookName)}">`}
-                        </div>
+                    <div class="pcx-pair">
+                        <label class="pcx-field">
+                            <span>${tUi(uiLang, 'Куда сохранить результат?', 'Save Target')}</span>
+                            <select id="pcx-fg-target-mode" class="pcx-input">
+                                <option value="new" ${state.targetBookMode === 'new' ? 'selected' : ''}>${tUi(uiLang, 'Создать новый Лорбук', 'Create New Lorebook')}</option>
+                                ${state.books.length > 0 ? `<option value="existing" ${state.targetBookMode === 'existing' ? 'selected' : ''}>${tUi(uiLang, 'Дополнить существующий том', 'Append to Existing Tome')}</option>` : ''}
+                            </select>
+                        </label>
+                        ${state.targetBookMode === 'existing' && state.books.length > 0 ? `
+                            <label class="pcx-field">
+                                <span>${tUi(uiLang, 'Выберите книгу на полке', 'Target Book')}</span>
+                                <select id="pcx-fg-target-existing" class="pcx-input">
+                                    ${state.books.map(b => `<option value="${escapeHtml(b.file_id)}" ${state.targetExistingId === b.file_id ? 'selected' : ''}>${escapeHtml(b.name)}</option>`).join('')}
+                                </select>
+                            </label>
+                        ` : `
+                            <label class="pcx-field">
+                                <span>${tUi(uiLang, 'Название новой книги', 'New Book Name')}</span>
+                                <input type="text" id="pcx-fg-target-name" class="pcx-input" placeholder="${tUi(uiLang, 'Хроники мира...', 'World Chronicles...')}" value="${escapeHtml(state.targetBookName)}">
+                            </label>
+                        `}
                     </div>
-                    <div class="pcx-row-2">
-                        <div>
-                            <label class="pcx-field-label">${tUi(uiLang, 'Подключение книги', 'Bind Scope')} ${renderHelpBtn('forge_scope')}</label>
-                            <select id="pcx-fg-bind-scope-after" class="pcx-select">
-                                <option value="global" ${state.bindAfterScope === 'global' ? 'selected' : ''}>${tUi(uiLang, 'Глобально (меню Мира Таверны)', 'Global (ST World menu)')}</option>
+                    <div class="pcx-pair">
+                        <label class="pcx-field">
+                            <span>${tUi(uiLang, 'Подключение книги после ковки', 'Bind Scope After Forge')}</span>
+                            <select id="pcx-fg-bind-scope-after" class="pcx-input">
                                 ${stApi.isChatOpen() ? `<option value="chat" ${state.bindAfterScope === 'chat' ? 'selected' : ''}>${tUi(uiLang, 'Только в этот чат', 'This Chat Only')}</option>` : ''}
+                                <option value="global" ${state.bindAfterScope === 'global' ? 'selected' : ''}>${tUi(uiLang, 'Глобально (меню Мира Таверны)', 'Global (World Info menu)')}</option>
                                 ${isSingleCharOpen() ? `<option value="char" ${state.bindAfterScope === 'char' ? 'selected' : ''}>${tUi(uiLang, 'К карточке персонажа', 'Character Card')}</option>` : ''}
-                                <option value="none" ${state.bindAfterScope === 'none' ? 'selected' : ''}>${tUi(uiLang, 'Не подключать сразу', 'Do not bind yet')}</option>
+                                <option value="none" ${state.bindAfterScope === 'none' ? 'selected' : ''}>${tUi(uiLang, 'Не подключать сразу', 'Do Not Bind Immediately')}</option>
                             </select>
-                        </div>
-                        <div>
-                            <label class="pcx-field-label">${tUi(uiLang, 'Режим сборки', 'Forge Mode')} ${renderHelpBtn('forge_mode')}</label>
-                            <select id="pcx-fg-wiz-mode" class="pcx-select">
-                                <option value="ai_adapt" ${state.wizMode === 'ai_adapt' ? 'selected' : ''}>${tUi(uiLang, 'Генерация Лорбука с Соавтором ИИ', 'Generate with AI Co-Author')}</option>
-                                <option value="verbatim_keys" ${state.wizMode === 'verbatim_keys' ? 'selected' : ''}>${tUi(uiLang, 'Мой текст дословно + ключи от ИИ', 'Verbatim Text + AI Keys')}</option>
-                                <option value="direct_no_ai" ${state.wizMode === 'direct_no_ai' ? 'selected' : ''}>${tUi(uiLang, 'Прямой перенос без ИИ', 'Direct Copy (No AI)')}</option>
+                        </label>
+                        <label class="pcx-field">
+                            <span>${tUi(uiLang, 'Режим сборки', 'Forge Assembly Mode')} ${renderHelpBtn('forge_mode')}</span>
+                            <select id="pcx-fg-wiz-mode" class="pcx-input">
+                                <option value="ai_adapt" ${state.wizMode === 'ai_adapt' ? 'selected' : ''}>${tUi(uiLang, 'Генерация Лорбука с Соавтором ИИ', 'AI Lorebook Generation')}</option>
+                                <option value="verbatim_keys" ${state.wizMode === 'verbatim_keys' ? 'selected' : ''}>${tUi(uiLang, 'Мой текст дословно + ключи от ИИ', 'Verbatim Text + AI Trigger Keys')}</option>
+                                <option value="direct" ${state.wizMode === 'direct' ? 'selected' : ''}>${tUi(uiLang, 'Прямой перенос заметок из Тетради без ИИ', 'Direct Notebook Transfer (No AI)')}</option>
                             </select>
-                        </div>
+                        </label>
                     </div>
-                    ${renderHelpBubble('forge_scope')}${renderHelpBubble('forge_mode')}
+                    ${renderHelpBubble('forge_mode')}
 
                     ${state.wizMode === 'ai_adapt' ? `
-                        <div class="pcx-preset-bar">
-                            <div>
-                                <label class="pcx-field-label">${ICONS.template}<span style="margin-left:5px">${tUi(uiLang, 'Предустановленный шаблон промпта', 'Prompt Preset')}</span></label>
-                                <select id="pcx-fg-book-preset" class="pcx-select">
-                                    ${FORGE_BOOK_PRESETS.map(pr => `<option value="${escapeHtml(pr.id)}" ${pr.id === activePreset.id ? 'selected' : ''}>${escapeHtml(uiLang === 'en' ? pr.nameEn : pr.name)}</option>`).join('')}
+                        <div class="pcx-pair">
+                            <label class="pcx-field">
+                                <span>${tUi(uiLang, 'Шаблон промпта Кузницы', 'Forge Preset')}</span>
+                                <select id="pcx-fg-book-preset" class="pcx-input">
+                                    ${allForgePresets.map(p => `<option value="${escapeHtml(p.id)}" ${p.id === activePreset.id ? 'selected' : ''}>${p.isCustom ? '[Мой] ' : ''}${escapeHtml(uiLang === 'en' ? (p.nameEn || p.name) : p.name)}</option>`).join('')}
                                 </select>
+                            </label>
+                            <div class="pcx-field" style="align-content:end;">
+                                <div class="pcx-actions">
+                                    <button type="button" class="pcx-btn pcx-btn-secondary" id="pcx-fg-open-custom-preset">${ICONS.plus}<span>${tUi(uiLang, 'Свой пресет', 'Save Custom')}</span></button>
+                                    <button type="button" class="pcx-btn pcx-btn-secondary" id="pcx-fg-toggle-book-prompt">${ICONS.sliders}<span>${state.showBookPromptEditor ? tUi(uiLang, 'Скрыть промпт', 'Hide Prompt') : tUi(uiLang, 'Промпт ИИ', 'System Prompt')}</span></button>
+                                </div>
                             </div>
-                            <button type="button" class="pcx-icon-btn ${state.showBookPromptEditor ? 'pcx-active' : ''}" style="height:38px;" id="pcx-fg-toggle-book-prompt">${ICONS.sliders}<span>${tUi(uiLang, 'Промпт', 'Prompt')}</span></button>
                         </div>
 
-                        ${state.showBookPromptEditor ? `
-                            <div style="padding:10px;border:1px solid var(--pcx-border);border-radius:var(--pcx-radius);background:var(--pcx-bg);display:flex;flex-direction:column;gap:8px;">
-                                <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">
-                                    <span style="font-size:11px;color:var(--pcx-text-muted);">Метки: <b translate="no" class="notranslate">{{lang}}</b>, <b translate="no" class="notranslate">{{entry_count}}</b>, <b translate="no" class="notranslate">{{word_limit}}</b></span>
-                                    <button type="button" class="pcx-mini-btn" id="pcx-fg-reset-book-prompt">${ICONS.reset}<span>${tUi(uiLang, 'К шаблону', 'Reset to Preset')}</span></button>
+                        ${activePreset.isCustom ? `
+                            <div class="pcx-actions pcx-between pcx-surface" style="padding:8px 11px;background:var(--paper);">
+                                <small>${tUi(uiLang, 'Активен ваш пресет:', 'Active custom preset:')} <strong>«${escapeHtml(activePreset.name)}»</strong></small>
+                                <div class="pcx-actions">
+                                    <button type="button" class="pcx-btn pcx-btn-xs pcx-btn-secondary" id="pcx-fg-update-custom-preset">${ICONS.save}<span>${tUi(uiLang, 'Обновить', 'Update')}</span></button>
+                                    <button type="button" class="pcx-btn pcx-btn-xs pcx-btn-danger-ghost" id="pcx-fg-del-custom-preset">${ICONS.trash}<span>${tUi(uiLang, 'Удалить', 'Delete')}</span></button>
                                 </div>
-                                <textarea id="pcx-fg-book-sysprompt" class="pcx-textarea pcx-mono-area" style="min-height:145px">${escapeHtml(curBookPrompt)}</textarea>
                             </div>` : ''}
 
-                        <div>
-                            <div class="pcx-row-3">
-                                <div><label class="pcx-field-label">${tUi(uiLang, 'Страниц', 'Pages')} ${renderHelpBtn('forge_words')}</label><input id="pcx-fg-entry-cnt" type="number" min="0" max="30" class="pcx-input" value="${Math.max(0, Number(s.forgeEntryCount) ?? 5)}"></div>
-                                <div><label class="pcx-field-label">${tUi(uiLang, 'Слов от', 'Min Words')}</label><input id="pcx-fg-wmin" type="number" min="0" max="3000" class="pcx-input" value="${Math.max(0, Number(s.forgeWordsMin) ?? 60)}"></div>
-                                <div><label class="pcx-field-label">${tUi(uiLang, 'Слов до', 'Max Words')}</label><input id="pcx-fg-wmax" type="number" min="0" max="3000" class="pcx-input" value="${Math.max(0, Number(s.forgeWordsMax) ?? 220)}"></div>
-                            </div>
-                            ${renderHelpBubble('forge_words')}
-                        </div>
-
-                        <div>
-                            <label class="pcx-field-label">${tUi(uiLang, 'Запрос для Кузницы (тема, сеттинг или какие страницы придумать)', 'Forge Request (theme, setting, or ideas)')}</label>
-                            <textarea id="pcx-fg-wiz-task" class="pcx-textarea" style="min-height:86px" placeholder="${escapeHtml(activePreset.placeholder)}">${escapeHtml(state.wizCustomPrompt)}</textarea>
-                        </div>` : ''}
-
-                    <details class="pcx-spoiler">
-                        <summary style="padding:9px 12px;font-size:12px;">
-                            <span>${tUi(uiLang, 'Источники контекста, разделы Кодекса и модель', 'Context Sources, Codex Sections & Model')}</span>
-                            <span style="width:14px;height:14px;display:inline-flex">${ICONS.chevDown}</span>
-                        </summary>
-                        <div class="pcx-spoiler-body">
-                            ${state.wizMode !== 'direct_no_ai' ? `
-                                <div class="pcx-row-2">
-                                    <div><label class="pcx-field-label">${tUi(uiLang, 'Профиль ИИ', 'AI Profile')}</label>
-                                    <select id="pcx-fg-wiz-profile" class="pcx-select">
-                                        <option value="" ${!s.aiProfileId ? 'selected' : ''}>[ Текущее подключение ]</option>
-                                        ${profiles.map(p => `<option value="${escapeHtml(p.id)}" ${p.id === s.aiProfileId ? 'selected' : ''}>${escapeHtml(p.name || p.id)}</option>`).join('')}
-                                    </select></div>
-                                    <div><label class="pcx-field-label">${tUi(uiLang, 'Язык', 'Language')}</label>
-                                    <select id="pcx-fg-wiz-lang" class="pcx-select">
-                                        ${LANGUAGES.map(l => `<option value="${escapeHtml(l.id)}" ${s.aiLang === l.id ? 'selected' : ''}>${escapeHtml(l.label)}</option>`).join('')}
-                                    </select></div>
-                                </div>` : ''}
-                            ${state.wizMode === 'ai_adapt' ? `
-                                <div style="display:flex;gap:12px;flex-wrap:wrap;">
-                                    <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;cursor:pointer"><input type="checkbox" id="pcx-fg-src-char" ${state.wizUseChar ? 'checked' : ''}><span>Персонаж</span></label>
-                                    <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;cursor:pointer"><input type="checkbox" id="pcx-fg-src-scen" ${state.wizUseScenario ? 'checked' : ''}><span>Сценарий</span></label>
-                                    <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;cursor:pointer"><input type="checkbox" id="pcx-fg-src-pers" ${state.wizUsePersona ? 'checked' : ''}><span>Игрок</span></label>
-                                    <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;cursor:pointer"><input type="checkbox" id="pcx-fg-src-chat" ${state.wizUseChat ? 'checked' : ''}><span>Чат</span></label>
-                                </div>` : ''}
-                            <div>
-                                <label class="pcx-field-label">${tUi(uiLang, 'Опереться на разделы Кодекса Автора', 'Include Codex Sections')}</label>
-                                <div class="pcx-check-grid">
-                                    ${store.categories.map(cat => {
-                                        const cnt = store.notes.filter(n => n.categoryId === cat.id && n.enabled !== false).length;
-                                        return `<label class="pcx-check-item"><input type="checkbox" class="pcx-fg-cat-chk" data-catid="${escapeHtml(cat.id)}" ${state.wizSelectedCats[cat.id] ? 'checked' : ''}><span><b>${escapeHtml(cat.name)}</b> (${cnt})</span></label>`;
-                                    }).join('')}
+                        ${state.showCustomForgePresetBox ? `
+                            <div class="pcx-surface pcx-panel pcx-stack" style="background:var(--paper);">
+                                <strong>${tUi(uiLang, 'Сохранить свой личный пресет Кузницы', 'Save Custom Forge Preset')}</strong>
+                                <div class="pcx-pair">
+                                    <input type="text" id="pcx-fg-custom-name" class="pcx-input" placeholder="${tUi(uiLang, 'Название вашего пресета...', 'Your preset name...')}" value="${escapeHtml(state.customForgeNameDraft || '')}">
+                                    <input type="text" id="pcx-fg-custom-ph" class="pcx-input" placeholder="${tUi(uiLang, 'Подсказка поля идеи (необязательно)...', 'Optional placeholder...')}" value="${escapeHtml(state.customForgePhDraft || '')}">
                                 </div>
-                            </div>
-                            <label style="display:inline-flex;align-items:center;gap:7px;font-size:11.5px;cursor:pointer">
-                                <input type="checkbox" id="pcx-fg-mute-cats" ${state.wizMuteExportedCats ? 'checked' : ''}>
-                                <span>Отключить перенесённые разделы в Кодексе (чтобы не дублировались)</span>
-                            </label>
-                            <div><button type="button" class="pcx-mini-btn" id="pcx-fg-wiz-doc-btn">${ICONS.clip}<span>Прикрепить текстовый файл (${state.wizUploadedDocs.length})</span></button><input type="file" id="pcx-fg-wiz-doc-in" multiple accept=".txt,.md,.json,.csv" style="display:none"></div>
-                        </div>
-                    </details>
+                                <textarea id="pcx-fg-book-sysprompt" class="pcx-input pcx-mono" rows="4">${escapeHtml(curBookPrompt)}</textarea>
+                                <div class="pcx-actions pcx-end">
+                                    <button type="button" class="pcx-btn pcx-btn-sm pcx-btn-secondary" id="pcx-fg-cancel-custom-preset">${tUi(uiLang, 'Отмена', 'Cancel')}</button>
+                                    <button type="button" class="pcx-btn pcx-btn-sm pcx-btn-primary" id="pcx-fg-save-custom-preset">${ICONS.save}<span>${tUi(uiLang, 'Сохранить пресет', 'Save Preset')}</span></button>
+                                </div>
+                            </div>` : ''}
 
-                    <div style="display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap;">
-                        <button type="button" class="pcx-secondary-btn" id="pcx-fg-run-wiz-draft" ${state.wizForging ? 'disabled' : ''}>${ICONS.edit}<span>${tUi(uiLang, 'Сначала черновик', 'Review Draft')}</span></button>
-                        <button type="button" class="pcx-primary-btn" id="pcx-fg-run-wiz-direct" ${state.wizForging ? 'disabled' : ''}>${state.wizForging ? ICONS.spinner : ICONS.forge}<span>${state.wizForging ? tUi(uiLang, 'Куём книгу...', 'Forging...') : tUi(uiLang, 'Выковать сразу', 'Forge Immediately')}</span></button>
+                        ${(state.showBookPromptEditor && !state.showCustomForgePresetBox) ? `
+                            <div class="pcx-surface pcx-panel pcx-stack" style="background:var(--paper);">
+                                <div class="pcx-actions pcx-between">
+                                    <small>Макросы: <code>{{lang}}</code>, <code>{{word_limit}}</code>, <code>{{entry_count_rule}}</code></small>
+                                    <button type="button" class="pcx-btn pcx-btn-xs pcx-btn-secondary" id="pcx-fg-reset-book-prompt">${ICONS.reset}<span>${tUi(uiLang, 'К шаблону', 'Reset')}</span></button>
+                                </div>
+                                <textarea id="pcx-fg-book-sysprompt" class="pcx-input pcx-mono" rows="4">${escapeHtml(curBookPrompt)}</textarea>
+                            </div>` : ''}
+
+                        <div class="pcx-row-3">
+                            <label class="pcx-field"><span>${tUi(uiLang, 'Записей (0 = авто)', 'Entries (0=auto)')}</span><input type="number" id="pcx-fg-entry-cnt" class="pcx-input" min="0" max="50" value="${s.forgeEntryCount ?? 0}"></label>
+                            <label class="pcx-field"><span>${tUi(uiLang, 'Слов от', 'Min Words')}</span><input type="number" id="pcx-fg-wmin" class="pcx-input" min="0" max="5000" value="${s.forgeWordsMin ?? 60}"></label>
+                            <label class="pcx-field"><span>${tUi(uiLang, 'Слов до', 'Max Words')}</span><input type="number" id="pcx-fg-wmax" class="pcx-input" min="0" max="5000" value="${s.forgeWordsMax ?? 240}"></label>
+                        </div>
+
+                        <div class="pcx-pair">
+                            <label class="pcx-field">
+                                <span>${tUi(uiLang, 'Профиль подключения ИИ', 'AI Connection Profile')}</span>
+                                <select id="pcx-fg-wiz-profile" class="pcx-input">
+                                    <option value="" ${!s.aiProfileId ? 'selected' : ''}>${tUi(uiLang, '[ Текущее подключение SillyTavern ]', '[ Current Connection ]')}</option>
+                                    ${profiles.map(p => `<option value="${escapeHtml(p.id)}" ${s.aiProfileId === p.id ? 'selected' : ''}>${escapeHtml(p.name)}</option>`).join('')}
+                                </select>
+                            </label>
+                            <label class="pcx-field">
+                                <span>${tUi(uiLang, 'Язык текста', 'Output Language')}</span>
+                                <input type="text" id="pcx-fg-wiz-lang" class="pcx-input" value="${escapeHtml(s.aiLang || 'Русский')}">
+                            </label>
+                        </div>
+                    ` : ''}
+
+                    <label class="pcx-field">
+                        <span>${tUi(uiLang, 'Ваше задание / сырой текст мира (пишите свободно всё, что нужно включить)', 'Your World Idea / Raw Lore Text')}</span>
+                        <textarea id="pcx-fg-wiz-task" class="pcx-input" rows="4" placeholder="${escapeHtml(activePreset.placeholder || '')}">${escapeHtml(state.wizCustomPrompt)}</textarea>
+                    </label>
+
+                    <div class="pcx-surface pcx-panel pcx-stack" style="background:var(--paper);">
+                        <strong>${tUi(uiLang, 'Источники контекста и перенос из Тетради', 'Context Sources & Notebook Transfer')}</strong>
+                        <div class="pcx-chk-row">
+                            <label class="pcx-chk-label"><input type="checkbox" id="pcx-fg-src-char" ${state.wizUseChar ? 'checked' : ''}><span>${tUi(uiLang, 'Карточка персонажа', 'Character Card')}</span></label>
+                            <label class="pcx-chk-label"><input type="checkbox" id="pcx-fg-src-scen" ${state.wizUseScenario ? 'checked' : ''}><span>${tUi(uiLang, 'Сценарий', 'Scenario')}</span></label>
+                            <label class="pcx-chk-label"><input type="checkbox" id="pcx-fg-src-pers" ${state.wizUsePersona ? 'checked' : ''}><span>${tUi(uiLang, 'Персона игрока', 'User Persona')}</span></label>
+                            <label class="pcx-chk-label"><input type="checkbox" id="pcx-fg-src-chat" ${state.wizUseChat ? 'checked' : ''}><span>${tUi(uiLang, 'Последние посты чата', 'Recent Chat')}</span></label>
+                        </div>
+                        <small>${tUi(uiLang, 'Отметьте разделы Тетради, если хотите переплавить их карточки в страницы Лорбука:', 'Select Notebook sections to smelt into Lorebook entries:')}</small>
+                        <div class="pcx-chip-row">
+                            ${store.categories.map(c => {
+                                const on = Boolean(state.wizSelectedCats[c.id]);
+                                const cnt = store.notes.filter(n => n.categoryId === c.id && n.enabled !== false).length;
+                                return `<button type="button" class="pcx-chip ${on ? 'pcx-active' : ''}" data-wz-cat="${escapeHtml(c.id)}"><span>${escapeHtml(displayCategoryName(c, uiLang))}</span><span class="pcx-key-badge">${cnt}</span></button>`;
+                            }).join('')}
+                        </div>
+                        <div class="pcx-actions pcx-between">
+                            <label class="pcx-chk-label">
+                                <input type="checkbox" id="pcx-fg-mute-cats" ${state.wizMuteExportedCats ? 'checked' : ''}>
+                                <span>${tUi(uiLang, 'Выключить перенесённые разделы Тетради после записи', 'Auto-mute transferred Notebook sections')}</span>
+                            </label>
+                            <div>
+                                <button type="button" class="pcx-btn pcx-btn-xs pcx-btn-secondary" id="pcx-fg-wiz-doc-btn">${ICONS.clip}<span>${state.wizUploadedDocs.length ? `${tUi(uiLang, 'Файлов:', 'Files:')} ${state.wizUploadedDocs.length}` : tUi(uiLang, '+ Прикрепить .txt / .md', '+ Attach .txt / .md')}</span></button>
+                                <input type="file" id="pcx-fg-wiz-doc-in" accept=".txt,.md,.json,.csv" multiple hidden>
+                            </div>
+                        </div>
                     </div>
-                    ${state.wizStatus ? `<div style="font-size:12px;color:var(--pcx-accent);">${escapeHtml(state.wizStatus)}</div>` : ''}
+
+                    ${state.wizStatus ? `<div class="pcx-guide-note">${state.wizForging ? ICONS.spinner : ''} <span>${escapeHtml(state.wizStatus)}</span></div>` : ''}
+
+                    <div class="pcx-actions pcx-end">
+                        <button type="button" class="pcx-btn pcx-btn-secondary" id="pcx-fg-run-wiz-draft" ${state.wizForging ? 'disabled' : ''}>${tUi(uiLang, 'Сначала на стол проверки (Черновик)', 'Preview on Staging Table')}</button>
+                        <button type="button" class="pcx-btn pcx-btn-primary" id="pcx-fg-run-wiz-direct" ${state.wizForging ? 'disabled' : ''}>${state.wizForging ? ICONS.spinner : ICONS.forge}<span>${tUi(uiLang, 'Выковать и сразу сохранить', 'Forge & Save Directly')}</span></button>
+                    </div>
                 </div>`;
         }
 
-        // APPROVE DRAFT (with collapsible draft cards!)
+        // 4. STAGING TABLE (1:1 Concept renderForgeStaging)
         if (state.screen === 'approve') {
-            const allStCol = state.stagedEntries.length > 0 && state.stagedEntries.every((_, i) => state.stagedCollapsed[i]);
+            const allStCol = state.stagedEntries.length > 0 && state.stagedEntries.every((_, i) => Boolean(state.stagedCollapsed[i]));
+            const incCount = state.stagedEntries.filter(x => x.included).length;
             return `
-                <div class="pcx-panel-box">
-                    <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">
-                        <span style="font-size:14.5px;font-weight:800;">Черновик страниц (${state.stagedEntries.length})</span>
-                        <div style="display:flex;gap:6px;">
-                            ${state.stagedEntries.length > 1 ? `<button type="button" class="pcx-mini-btn" id="pcx-st-collapse-all">${allStCol ? ICONS.chevDown : ICONS.chevUp}<span>${allStCol ? 'Развернуть все' : 'Свернуть все'}</span></button>` : ''}
-                            <button type="button" class="pcx-mini-btn" id="pcx-fg-back-wiz">${ICONS.chevLeft}<span>Назад</span></button>
-                        </div>
+                <button type="button" class="pcx-back-link" id="pcx-fg-back-wiz">${ICONS.chevLeft}<span>${tUi(uiLang, 'Назад к настройкам Ковки', 'Back to Wizard')}</span></button>
+                <div class="pcx-page-head">
+                    <div>
+                        <h1>${tUi(uiLang, 'Стол проверки перед записью в том', 'Staging Table Before Commit')}</h1>
+                        <p>${tUi(uiLang, 'Проверьте или поправьте сгенерированные статьи и ключи вручную — в Лорбук попадут только отмеченные карточки.', 'Review, edit, or toggle drafted entries before committing them atomically into the Lorebook.')}</p>
                     </div>
-                    ${state.saveError ? `<div class="pcx-err-banner"><span>${escapeHtml(state.saveError)}</span></div>` : ''}
-                    <div style="display:flex;flex-direction:column;gap:10px;max-height:400px;overflow-y:auto;">
-                        ${state.stagedEntries.map((st, idx) => {
-                            const isCol = Boolean(state.stagedCollapsed[idx]);
-                            return `
-                            <div class="pcx-card ${isCol ? 'pcx-collapsed' : ''}" data-stage-idx="${idx}">
-                                <div class="pcx-card-top">
-                                    <div class="pcx-card-title-group">
-                                        <input type="checkbox" class="pcx-st-inc" data-idx="${idx}" ${st.included ? 'checked' : ''}>
-                                        <div class="pcx-card-title" data-st-col="${idx}">${escapeHtml(st.comment || ('Страница #' + (idx + 1)))}</div>
+                    <div class="pcx-actions">
+                        ${state.stagedEntries.length > 1 ? `<button type="button" class="pcx-btn pcx-btn-secondary" id="pcx-st-collapse-all">${allStCol ? tUi(uiLang, 'Развернуть все', 'Expand All') : tUi(uiLang, 'Свернуть все', 'Collapse All')}</button>` : ''}
+                        <button type="button" class="pcx-btn pcx-btn-primary" id="pcx-fg-commit-btn" ${(state.commitSavingBusy || incCount === 0) ? 'disabled' : ''}>${ICONS.check}<span>${tUi(uiLang, `Записать (${incCount}) в Лорбук`, `Commit (${incCount})`)}</span></button>
+                    </div>
+                </div>
+                ${state.saveError ? `<div class="pcx-guide-note" style="background:var(--danger-wash);color:var(--danger);">${escapeHtml(state.saveError)}</div>` : ''}
+                <div class="pcx-stack">
+                    ${state.stagedEntries.map((st, idx) => {
+                        const isCol = Boolean(state.stagedCollapsed[idx]);
+                        return `
+                            <article class="pcx-note-card ${!st.included ? 'pcx-disabled-card' : ''} ${!isCol ? 'pcx-is-open' : ''}" data-stage-idx="${idx}">
+                                <div class="pcx-note-head">
+                                    <div class="pcx-note-title-wrap">
+                                        <input type="checkbox" class="pcx-st-inc" data-idx="${idx}" ${st.included ? 'checked' : ''} style="width:16px;height:16px;accent-color:var(--accent);">
+                                        <button type="button" class="pcx-note-title-btn" data-st-col="${idx}">
+                                            <span class="pcx-note-title-text">${escapeHtml(st.comment || ('Страница #' + (idx + 1)))}</span>
+                                        </button>
                                     </div>
-                                    <button type="button" class="pcx-collapse-btn" data-st-col="${idx}">${isCol ? ICONS.chevDown : ICONS.chevUp}</button>
+                                    <button type="button" class="pcx-btn pcx-btn-xs pcx-btn-secondary" data-st-col="${idx}">${isCol ? ICONS.chevDown : ICONS.chevUp}</button>
                                 </div>
                                 ${!isCol ? `
-                                    <div><label class="pcx-field-label">Название страницы</label><input class="pcx-input pcx-st-comment" data-idx="${idx}" value="${escapeHtml(st.comment)}"></div>
-                                    <div><label class="pcx-field-label">Ключевые слова (через запятую)</label><input class="pcx-input pcx-st-keys" data-idx="${idx}" value="${escapeHtml(st.keys)}"></div>
-                                    <div class="pcx-row-3">
-                                        <div><label class="pcx-field-label">Активация</label><select class="pcx-select pcx-st-trig" data-idx="${idx}"><option value="keys" ${(!st.constant && !st.vectorized) ? 'selected' : ''}>По ключам</option><option value="const" ${st.constant ? 'selected' : ''}>Постоянно</option><option value="vec" ${st.vectorized ? 'selected' : ''}>Вектор</option></select></div>
-                                        <div><label class="pcx-field-label">Позиция</label><select class="pcx-select pcx-st-pos" data-idx="${idx}">${renderPositionOptions(st.position, uiLang)}</select></div>
-                                        <div><label class="pcx-field-label">${Number(st.position) === 4 ? 'Глубина' : 'Роль'}</label>${Number(st.position) === 4 ? `<input type="number" min="0" max="999" class="pcx-input pcx-st-depth" data-idx="${idx}" value="${parseSafeDepth(st.depth, 4)}">` : `<select class="pcx-select pcx-st-role" data-idx="${idx}"><option value="0" ${Number(st.role) === 0 ? 'selected' : ''}>System</option><option value="1" ${Number(st.role) === 1 ? 'selected' : ''}>User</option><option value="2" ${Number(st.role) === 2 ? 'selected' : ''}>Assistant</option></select>`}</div>
-                                    </div>
-                                    ${Number(st.position) === 7 ? `<div><label class="pcx-field-label">${tUi(uiLang, 'Имя шлюза Outlet (для макроса {{outlet::Имя}})', 'Outlet Name (for {{outlet::Name}})')}</label><input class="pcx-input pcx-st-outlet" data-idx="${idx}" placeholder="LoreOutlet" value="${escapeHtml(st.outletName || '')}"></div>` : ''}
-                                    <textarea class="pcx-textarea pcx-st-content" data-idx="${idx}" style="min-height:85px">${escapeHtml(st.content)}</textarea>
-                                ` : ''}
-                            </div>`;
-                        }).join('')}
-                    </div>
-                    <div style="display:flex;justify-content:flex-end;"><button type="button" class="pcx-primary-btn" id="pcx-fg-commit-btn" ${state.commitSavingBusy ? 'disabled' : ''}>${ICONS.check}<span>Сохранить в Лорбук</span></button></div>
+                                    <div class="pcx-note-body">
+                                        <div class="pcx-pair">
+                                            <label class="pcx-field"><span>${tUi(uiLang, 'Заголовок страницы', 'Page Title')}</span><input class="pcx-input pcx-st-comment" data-idx="${idx}" value="${escapeHtml(st.comment)}"></label>
+                                            <label class="pcx-field"><span>${tUi(uiLang, 'Ключи срабатывания', 'Trigger Keys')}</span><input class="pcx-input pcx-st-keys" data-idx="${idx}" value="${escapeHtml(st.keys)}"></label>
+                                        </div>
+                                        <div class="pcx-row-3">
+                                            <label class="pcx-field"><span>${tUi(uiLang, 'Активация', 'Trigger')}</span><select class="pcx-input pcx-st-trig" data-idx="${idx}"><option value="keys" ${(!st.constant && !st.vectorized) ? 'selected' : ''}>По ключам</option><option value="const" ${st.constant ? 'selected' : ''}>Постоянно</option><option value="vec" ${st.vectorized ? 'selected' : ''}>Вектор</option></select></label>
+                                            <label class="pcx-field"><span>${tUi(uiLang, 'Позиция', 'Position')}</span><select class="pcx-input pcx-st-pos" data-idx="${idx}">${renderPositionOptions(st.position, uiLang)}</select></label>
+                                            <label class="pcx-field"><span>${Number(st.position) === 4 ? tUi(uiLang, 'Глубина', 'Depth') : tUi(uiLang, 'Роль', 'Role')}</span>${Number(st.position) === 4 ? `<input type="number" min="0" max="999" class="pcx-input pcx-st-depth" data-idx="${idx}" value="${parseSafeDepth(st.depth, 4)}">` : `<select class="pcx-input pcx-st-role" data-idx="${idx}"><option value="0" ${Number(st.role) === 0 ? 'selected' : ''}>System</option><option value="1" ${Number(st.role) === 1 ? 'selected' : ''}>User</option><option value="2" ${Number(st.role) === 2 ? 'selected' : ''}>Assistant</option></select>`}</label>
+                                        </div>
+                                        ${Number(st.position) === 7 ? `<label class="pcx-field"><span>Outlet ({{outlet::Имя}})</span><input class="pcx-input pcx-st-outlet" data-idx="${idx}" placeholder="LoreOutlet" value="${escapeHtml(st.outletName || '')}"></label>` : ''}
+                                        <textarea class="pcx-input pcx-st-content" data-idx="${idx}" rows="4">${escapeHtml(st.content)}</textarea>
+                                    </div>` : ''}
+                            </article>`;
+                    }).join('')}
                 </div>`;
         }
 
-        // SINGLE PAGE EDITOR (Manual with paragraph align & recursion flags + AI with presets, word count & prompt editor)
+        // 5. SINGLE PAGE EDITOR (1:1 Concept renderForgeEntryEditor + Custom Presets + 3-way merge)
         if (state.screen === 'entry_edit' && state.entryDraft) {
-            const d = state.entryDraft, pos = Number(d.position);
-            const trigMode = d.constant ? 'const' : (d.vectorized ? 'vec' : 'keys');
-            const isNewEntry = state.editingUid === null;
-            const activeCand = state.pageAiCandidates[state.pageAiCandIdx] || null;
+            const d = state.entryDraft;
             const curPagePrompt = (s.forgePageSystemPrompt && s.forgePageSystemPrompt.trim()) ? s.forgePageSystemPrompt : activePreset.pagePrompt;
-
-            const studioHtml = !activeCand ? '' : `
-                <div class="pcx-ai-studio">
-                    <div class="pcx-ai-ver-bar">
-                        <span style="font-size:12px;font-weight:800;color:var(--pcx-accent);">Вариант Соавтора (${state.pageAiCandIdx + 1} / ${state.pageAiCandidates.length})</span>
-                        ${state.pageAiCandidates.length > 1 ? `<div style="display:flex;gap:5px;"><button type="button" class="pcx-mini-btn" id="pcx-fgc-prev" ${state.pageAiCandIdx <= 0 ? 'disabled' : ''}>${ICONS.chevLeft}</button><button type="button" class="pcx-mini-btn" id="pcx-fgc-next" ${state.pageAiCandIdx >= state.pageAiCandidates.length - 1 ? 'disabled' : ''}>${ICONS.chevRight}</button></div>` : ''}
-                    </div>
-                    <div><label class="pcx-field-label">Название страницы</label><input id="pcx-fgc-comment" class="pcx-input" value="${escapeHtml(activeCand.comment || '')}"></div>
-                    <div><label class="pcx-field-label">Ключевые слова (через запятую)</label><input id="pcx-fgc-keys" class="pcx-input" value="${escapeHtml(activeCand.keys || '')}"></div>
-                    <div><label class="pcx-field-label">Текст страницы</label><textarea id="pcx-fgc-content" class="pcx-textarea" style="min-height:130px">${escapeHtml(activeCand.content || '')}</textarea></div>
-                    <div style="padding-top:6px;border-top:1px solid var(--pcx-border);display:flex;flex-direction:column;gap:8px;">
-                        <textarea id="pcx-fgc-refine" class="pcx-textarea" style="min-height:52px" placeholder="Если нужно что-то поправить — напиши сюда и нажми «Переделать»...">${escapeHtml(state.pageAiRefineText || '')}</textarea>
-                        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">
-                            <button type="button" id="pcx-fgc-run-refine" class="pcx-secondary-btn" ${state.pageAiGenerating ? 'disabled' : ''}>${state.pageAiGenerating ? ICONS.spinner : ICONS.spark}<span>Переделать</span></button>
-                            <button type="button" id="pcx-fgc-save-now" class="pcx-primary-btn" ${state.entrySavingBusy ? 'disabled' : ''}>${ICONS.check}<span>Сохранить в Лорбук</span></button>
-                        </div>
-                    </div>
-                </div>`;
+            const cand = state.pageAiCandidates[state.pageAiCandIdx] || null;
+            const keysVal = state.entryKeysDirty ? state.entryKeysRawText : (Array.isArray(d.key) ? d.key.join(', ') : '');
+            const trigMode = d.constant ? 'const' : (d.vectorized ? 'vec' : 'keys');
 
             return `
-                <div class="pcx-panel-box">
-                    <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
-                        <span style="font-size:14.5px;font-weight:800;">${isNewEntry ? tUi(uiLang, 'Новая страница Лорбука', 'New Lorebook Page') : tUi(uiLang, 'Редактирование страницы', 'Edit Lorebook Page')}</span>
-                        <button type="button" class="pcx-mini-btn" id="pcx-fge-cancel">${ICONS.chevLeft}<span>${tUi(uiLang, 'Назад', 'Back')}</span></button>
+                <button type="button" class="pcx-back-link" id="pcx-fge-cancel">${ICONS.chevLeft}<span>${state.activeBookId ? tUi(uiLang, 'Назад к страницам книги', 'Back to Book Pages') : tUi(uiLang, 'Назад на Полку', 'Back to Shelf')}</span></button>
+                <div class="pcx-surface pcx-panel pcx-stack">
+                    <div class="pcx-actions pcx-between">
+                        <h2>${state.editingUid !== null ? tUi(uiLang, 'Редактор страницы Лорбука', 'Edit Lorebook Page') : tUi(uiLang, 'Новая страница Лорбука', 'New Lorebook Page')}</h2>
+                        <select id="pcx-fge-book-select" class="pcx-input" style="width:auto !important;min-width:165px;max-width:260px;">
+                            ${state.books.map(b => `<option value="${escapeHtml(b.file_id)}" ${b.file_id === state.entryTargetBookId ? 'selected' : ''}>${tUi(uiLang, 'Том:', 'Tome:')} ${escapeHtml(b.name)}</option>`).join('')}
+                        </select>
                     </div>
+                    ${state.saveError ? `<div class="pcx-guide-note" style="background:var(--danger-wash);color:var(--danger);">${escapeHtml(state.saveError)}</div>` : ''}
 
-                    ${(isNewEntry && state.books.length > 1) ? `
-                        <div>
-                            <label class="pcx-field-label">${tUi(uiLang, 'Книга назначения', 'Target Lorebook')}</label>
-                            <select id="pcx-fge-book-select" class="pcx-select">
-                                ${state.books.map(b => `<option value="${escapeHtml(b.file_id)}" ${b.file_id === state.entryTargetBookId ? 'selected' : ''}>${escapeHtml(b.name)}</option>`).join('')}
-                            </select>
-                        </div>` : ''}
-
-                    ${state.saveError ? `<div class="pcx-err-banner"><span>${escapeHtml(state.saveError)}</span></div>` : ''}
-                    <div class="pcx-mode-tabs">
-                        <button type="button" class="pcx-mode-tab ${state.entryEditTab === 'manual' ? 'pcx-active' : ''}" data-fgetab="manual">${ICONS.edit}<span>${tUi(uiLang, 'Вручную', 'Manual')}</span></button>
-                        <button type="button" class="pcx-mode-tab ${state.entryEditTab === 'ai' ? 'pcx-active' : ''}" data-fgetab="ai">${ICONS.spark}<span>${tUi(uiLang, 'С Соавтором (ИИ)', 'AI Co-Author')}</span></button>
+                    <div class="pcx-seg-tabs">
+                        <button type="button" class="pcx-seg-tab ${state.entryEditTab === 'manual' ? 'pcx-active' : ''}" data-fgetab="manual">${tUi(uiLang, 'Вручную', 'Manual')}</button>
+                        <button type="button" class="pcx-seg-tab ${state.entryEditTab === 'ai' ? 'pcx-active' : ''}" data-fgetab="ai">${tUi(uiLang, 'С Соавтором (ИИ)', 'AI Co-Author')}</button>
                     </div>
 
                     ${state.entryEditTab === 'ai' ? `
-                        <div class="pcx-preset-bar">
-                            <div>
-                                <label class="pcx-field-label">${ICONS.template}<span style="margin-left:5px">${tUi(uiLang, 'Шаблон задачи (Пресет)', 'Prompt Preset')}</span></label>
-                                <select id="pcx-fgp-preset" class="pcx-select">
-                                    ${FORGE_BOOK_PRESETS.map(pr => `<option value="${escapeHtml(pr.id)}" ${pr.id === activePreset.id ? 'selected' : ''}>${escapeHtml(uiLang === 'en' ? pr.nameEn : pr.name)}</option>`).join('')}
+                        <div class="pcx-pair">
+                            <label class="pcx-field">
+                                <span>${tUi(uiLang, 'Шаблон задачи (Пресет)', 'Forge Preset')}</span>
+                                <select id="pcx-fgp-preset" class="pcx-input">
+                                    ${allForgePresets.map(p => `<option value="${escapeHtml(p.id)}" ${p.id === activePreset.id ? 'selected' : ''}>${p.isCustom ? '[Мой] ' : ''}${escapeHtml(uiLang === 'en' ? (p.nameEn || p.name) : p.name)}</option>`).join('')}
                                 </select>
+                            </label>
+                            <div class="pcx-field" style="align-content:end;">
+                                <div class="pcx-actions">
+                                    <button type="button" class="pcx-btn pcx-btn-secondary" id="pcx-fg-open-custom-preset">${ICONS.plus}<span>${tUi(uiLang, 'Свой', 'Custom')}</span></button>
+                                    <button type="button" class="pcx-btn pcx-btn-secondary" id="pcx-fgp-toggle-prompt">${ICONS.sliders}<span>${state.showPagePromptEditor ? tUi(uiLang, 'Скрыть промпт', 'Hide Prompt') : tUi(uiLang, 'Промпт ИИ', 'System Prompt')}</span></button>
+                                </div>
                             </div>
-                            <button type="button" class="pcx-icon-btn ${state.showPagePromptEditor ? 'pcx-active' : ''}" style="height:38px;" id="pcx-fgp-toggle-prompt">${ICONS.sliders}<span>${tUi(uiLang, 'Промпт', 'Prompt')}</span></button>
                         </div>
 
-                        ${state.showPagePromptEditor ? `
-                            <div style="padding:10px;border:1px solid var(--pcx-border);border-radius:var(--pcx-radius);background:var(--pcx-bg);display:flex;flex-direction:column;gap:8px;">
-                                <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">
-                                    <span style="font-size:11px;color:var(--pcx-text-muted);">Метки: <b translate="no" class="notranslate">{{lang}}</b>, <b translate="no" class="notranslate">{{word_limit}}</b></span>
-                                    <button type="button" class="pcx-mini-btn" id="pcx-fgp-reset-prompt">${ICONS.reset}<span>К шаблону</span></button>
+                        ${activePreset.isCustom ? `
+                            <div class="pcx-actions pcx-between pcx-surface" style="padding:8px 11px;background:var(--paper);">
+                                <small>${tUi(uiLang, 'Ваш пресет:', 'Custom preset:')} <strong>«${escapeHtml(activePreset.name)}»</strong></small>
+                                <div class="pcx-actions">
+                                    <button type="button" class="pcx-btn pcx-btn-xs pcx-btn-secondary" id="pcx-fg-update-custom-preset">${ICONS.save}<span>${tUi(uiLang, 'Обновить', 'Update')}</span></button>
+                                    <button type="button" class="pcx-btn pcx-btn-xs pcx-btn-danger-ghost" id="pcx-fg-del-custom-preset">${ICONS.trash}</button>
                                 </div>
-                                <textarea id="pcx-fgp-sysprompt" class="pcx-textarea pcx-mono-area" style="min-height:140px">${escapeHtml(curPagePrompt)}</textarea>
                             </div>` : ''}
 
-                        <div>
-                            <div class="pcx-row-3">
-                                <div><label class="pcx-field-label">${tUi(uiLang, 'Слов от', 'Min Words')} ${renderHelpBtn('ai_words')}</label><input id="pcx-fgp-wmin" type="number" min="0" max="4000" class="pcx-input" value="${Math.max(0, Number(s.forgeWordsMin) ?? 60)}"></div>
-                                <div><label class="pcx-field-label">${tUi(uiLang, 'Слов до', 'Max Words')}</label><input id="pcx-fgp-wmax" type="number" min="0" max="4000" class="pcx-input" value="${Math.max(0, Number(s.forgeWordsMax) ?? 220)}"></div>
-                                <div><label class="pcx-field-label">${tUi(uiLang, 'Чат', 'Chat')} ${renderHelpBtn('ai_radius')}</label><input id="pcx-fgp-radius" type="number" min="0" max="200" class="pcx-input" value="${Math.max(0, Number(s.aiChatRadius) ?? 10)}"></div>
-                            </div>
-                            ${renderHelpBubble('ai_words')}${renderHelpBubble('ai_radius')}
+                        ${state.showCustomForgePresetBox ? `
+                            <div class="pcx-surface pcx-panel pcx-stack" style="background:var(--paper);">
+                                <strong>${tUi(uiLang, 'Сохранить свой пресет страницы', 'Save Custom Page Preset')}</strong>
+                                <div class="pcx-pair">
+                                    <input type="text" id="pcx-fg-custom-name" class="pcx-input" placeholder="${tUi(uiLang, 'Название вашего пресета...', 'Your preset name...')}" value="${escapeHtml(state.customForgeNameDraft || '')}">
+                                    <input type="text" id="pcx-fg-custom-ph" class="pcx-input" placeholder="${tUi(uiLang, 'Подсказка поля идеи...', 'Optional placeholder...')}" value="${escapeHtml(state.customForgePhDraft || '')}">
+                                </div>
+                                <textarea id="pcx-fgp-sysprompt" class="pcx-input pcx-mono" rows="4">${escapeHtml(curPagePrompt)}</textarea>
+                                <div class="pcx-actions pcx-end">
+                                    <button type="button" class="pcx-btn pcx-btn-sm pcx-btn-secondary" id="pcx-fg-cancel-custom-preset">${tUi(uiLang, 'Отмена', 'Cancel')}</button>
+                                    <button type="button" class="pcx-btn pcx-btn-sm pcx-btn-primary" id="pcx-fg-save-custom-preset">${ICONS.save}<span>${tUi(uiLang, 'Сохранить пресет', 'Save Preset')}</span></button>
+                                </div>
+                            </div>` : ''}
+
+                        ${(state.showPagePromptEditor && !state.showCustomForgePresetBox) ? `
+                            <div class="pcx-surface pcx-panel pcx-stack" style="background:var(--paper);">
+                                <div class="pcx-actions pcx-between">
+                                    <small>Макросы: <code>{{lang}}</code>, <code>{{word_limit}}</code></small>
+                                    <button type="button" class="pcx-btn pcx-btn-xs pcx-btn-secondary" id="pcx-fgp-reset-prompt">${ICONS.reset}<span>${tUi(uiLang, 'К шаблону', 'Reset')}</span></button>
+                                </div>
+                                <textarea id="pcx-fgp-sysprompt" class="pcx-input pcx-mono" rows="4">${escapeHtml(curPagePrompt)}</textarea>
+                            </div>` : ''}
+
+                        <div class="pcx-row-3">
+                            <label class="pcx-field"><span>${tUi(uiLang, 'Слов от', 'Min Words')}</span><input type="number" id="pcx-fgp-wmin" class="pcx-input" min="0" max="5000" value="${s.forgeWordsMin ?? 60}"></label>
+                            <label class="pcx-field"><span>${tUi(uiLang, 'Слов до', 'Max Words')}</span><input type="number" id="pcx-fgp-wmax" class="pcx-input" min="0" max="5000" value="${s.forgeWordsMax ?? 240}"></label>
+                            <label class="pcx-field"><span>${tUi(uiLang, 'Постов чата', 'Chat Msgs')}</span><input type="number" id="pcx-fgp-radius" class="pcx-input" min="0" max="200" value="${s.aiChatRadius ?? 10}"></label>
                         </div>
 
-                        <div>
-                            <label class="pcx-field-label">${tUi(uiLang, 'О чём придумать страницу?', 'Page Idea / Request')} ${renderHelpBtn('forge_page_ai')}</label>
-                            ${renderHelpBubble('forge_page_ai')}
-                            <textarea id="pcx-fgp-task" class="pcx-textarea" style="min-height:86px" placeholder="${escapeHtml(activePreset.placeholder)}">${escapeHtml(state.pageAiTask || '')}</textarea>
-                        </div>
+                        <label class="pcx-field">
+                            <span>${tUi(uiLang, 'О чём придумать или как доработать страницу? (ваш свободный запрос)', 'What should AI write or refine on this page?')}</span>
+                            <textarea id="pcx-fgp-task" class="pcx-input" rows="4" placeholder="${escapeHtml(activePreset.placeholder || '')}">${escapeHtml(state.pageAiTask)}</textarea>
+                        </label>
 
                         <details class="pcx-spoiler">
-                            <summary style="padding:8px 11px;font-size:11.5px;color:var(--pcx-text-muted);">
-                                <span>Контекст и модель (настроены автоматически)</span>
-                                <span style="width:14px;height:14px;display:inline-flex">${ICONS.chevDown}</span>
-                            </summary>
+                            <summary><span>${tUi(uiLang, 'Контекст, профиль ИИ и слепой контур приватности', 'Context, AI Profile & Blind Lore Privacy')}</span>${ICONS.chevDown}</summary>
                             <div class="pcx-spoiler-body">
-                                <div class="pcx-row-2">
-                                    <div><label class="pcx-field-label">Профиль ИИ</label>
-                                    <select id="pcx-fgp-profile" class="pcx-select">
-                                        <option value="" ${!s.aiProfileId ? 'selected' : ''}>[ Текущее подключение ]</option>
-                                        ${profiles.map(p => `<option value="${escapeHtml(p.id)}" ${p.id === s.aiProfileId ? 'selected' : ''}>${escapeHtml(p.name || p.id)}</option>`).join('')}
-                                    </select></div>
-                                    <div><label class="pcx-field-label">Язык</label>
-                                    <select id="pcx-fgp-lang" class="pcx-select">
-                                        ${LANGUAGES.map(l => `<option value="${escapeHtml(l.id)}" ${s.aiLang === l.id ? 'selected' : ''}>${escapeHtml(l.label)}</option>`).join('')}
-                                    </select></div>
+                                <div class="pcx-pair">
+                                    <label class="pcx-field">
+                                        <span>${tUi(uiLang, 'Профиль подключения ИИ', 'AI Connection Profile')}</span>
+                                        <select id="pcx-fgp-profile" class="pcx-input">
+                                            <option value="" ${!s.aiProfileId ? 'selected' : ''}>${tUi(uiLang, '[ Текущее подключение ]', '[ Current Connection ]')}</option>
+                                            ${profiles.map(p => `<option value="${escapeHtml(p.id)}" ${s.aiProfileId === p.id ? 'selected' : ''}>${escapeHtml(p.name)}</option>`).join('')}
+                                        </select>
+                                    </label>
+                                    <label class="pcx-field">
+                                        <span>${tUi(uiLang, 'Целевой язык', 'Language')}</span>
+                                        <input type="text" id="pcx-fgp-lang" class="pcx-input" value="${escapeHtml(s.aiLang || 'Русский')}">
+                                    </label>
                                 </div>
-                                <div style="display:flex;gap:12px;flex-wrap:wrap;">
-                                    <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;cursor:pointer" title="Смотрит только на разметку/абзацы книги без чтения знаний и текстов"><input type="checkbox" id="pcx-fgp-fmt" ${state.pageAiMatchFormat ? 'checked' : ''}><span>${tUi(uiLang, 'Сверять только формат разметки', 'Format Skeleton Only')}</span></label>
-                                    <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;cursor:pointer"><input type="checkbox" id="pcx-fgp-char" ${state.pageAiUseChar ? 'checked' : ''}><span>${tUi(uiLang, 'Персонаж', 'Character')}</span></label>
-                                    <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;cursor:pointer"><input type="checkbox" id="pcx-fgp-pers" ${state.pageAiUsePersona ? 'checked' : ''}><span>${tUi(uiLang, 'Игрок', 'Persona')}</span></label>
-                                    <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;cursor:pointer"><input type="checkbox" id="pcx-fgp-chat" ${state.pageAiUseChat ? 'checked' : ''}><span>${tUi(uiLang, 'Чат', 'Chat')}</span></label>
+                                <div class="pcx-chk-row">
+                                    <label class="pcx-chk-label"><input type="checkbox" id="pcx-fgp-fmt" ${state.pageAiMatchFormat ? 'checked' : ''}><span>${tUi(uiLang, 'Слепой скелет разметки книги (без слива чужих текстов)', 'Blind structural skeleton only')}</span></label>
+                                    <label class="pcx-chk-label"><input type="checkbox" id="pcx-fgp-char" ${state.pageAiUseChar ? 'checked' : ''}><span>${tUi(uiLang, 'Персонаж', 'Character')}</span></label>
+                                    <label class="pcx-chk-label"><input type="checkbox" id="pcx-fgp-pers" ${state.pageAiUsePersona ? 'checked' : ''}><span>${tUi(uiLang, 'Персона', 'Persona')}</span></label>
+                                    <label class="pcx-chk-label"><input type="checkbox" id="pcx-fgp-chat" ${state.pageAiUseChat ? 'checked' : ''}><span>${tUi(uiLang, 'Чат', 'Chat')}</span></label>
                                 </div>
                             </div>
                         </details>
-                        <div style="display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap;">
-                            <button type="button" id="pcx-fgp-run-draft" class="pcx-secondary-btn" ${state.pageAiGenerating ? 'disabled' : ''}>${ICONS.edit}<span>Сначала черновик</span></button>
-                            <button type="button" id="pcx-fgp-run-direct" class="pcx-primary-btn" ${state.pageAiGenerating ? 'disabled' : ''}>${state.pageAiGenerating ? ICONS.spinner : ICONS.spark}<span>${state.pageAiGenerating ? 'Создаём...' : 'Создать и сохранить'}</span></button>
-                        </div>
-                        ${state.pageAiStatus ? `<div style="font-size:11.5px;color:var(--pcx-accent)">${escapeHtml(state.pageAiStatus)}</div>` : ''}
-                        ${studioHtml}
-                    ` : `
-                        <div><label class="pcx-field-label">Название страницы</label><input id="pcx-fge-comment" class="pcx-input" placeholder="Например: Таверна «Сломанный Компас»" value="${escapeHtml(d.comment)}"></div>
-                        <div>
-                            <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:5px;">
-                                <label class="pcx-field-label" style="margin:0">Ключевые слова (через запятую)</label>
-                                <button type="button" class="pcx-mini-btn" id="pcx-fge-genkeys" ${state.keysGenerating ? 'disabled' : ''}>
-                                    ${state.keysGenerating ? ICONS.spinner : ICONS.key}<span>${state.keysGenerating ? 'Подбор...' : 'Подобрать ключи ИИ'}</span>
-                                </button>
+
+                        ${state.pageAiStatus ? `<div class="pcx-guide-note">${state.pageAiGenerating ? ICONS.spinner : ''} <span>${escapeHtml(state.pageAiStatus)}</span></div>` : ''}
+
+                        <div class="pcx-actions pcx-between">
+                            <button type="button" class="pcx-chip" data-open-settings-modal="1">${escapeHtml(aiModeShort)}</button>
+                            <div class="pcx-actions">
+                                <button type="button" class="pcx-btn pcx-btn-secondary" id="pcx-fgp-run-draft" ${state.pageAiGenerating ? 'disabled' : ''}>${tUi(uiLang, 'Сначала черновик', 'Draft First')}</button>
+                                <button type="button" class="pcx-btn pcx-btn-primary" id="pcx-fgp-run-direct" ${state.pageAiGenerating ? 'disabled' : ''}>${state.pageAiGenerating ? ICONS.spinner : ICONS.spark}<span>${tUi(uiLang, 'Создать и сразу сохранить', 'Forge & Save')}</span></button>
                             </div>
-                            <input id="pcx-fge-keys" class="pcx-input" placeholder="compass, tavern, /\\brelic{1,2}\\b/i" value="${escapeHtml(state.entryKeysDirty ? state.entryKeysRawText : (Array.isArray(d.key) ? d.key.join(', ') : (d.key || '')))}">
                         </div>
-                        <div class="pcx-row-2">
-                            <div><label class="pcx-field-label">Активация ${renderHelpBtn('forge_trig')}</label><select id="pcx-fge-trig" class="pcx-select"><option value="keys" ${trigMode === 'keys' ? 'selected' : ''}>По ключам в чате</option><option value="const" ${trigMode === 'const' ? 'selected' : ''}>Постоянно</option><option value="vec" ${trigMode === 'vec' ? 'selected' : ''}>Векторизация</option></select></div>
-                            <div><label class="pcx-field-label">${tUi(uiLang, 'Позиция', 'Position')}</label><select id="pcx-fge-pos" class="pcx-select">${renderPositionOptions(pos, uiLang)}</select></div>
+
+                        ${cand ? `
+                            <div class="pcx-ai-cand-box">
+                                <div class="pcx-actions pcx-between">
+                                    <strong>${tUi(uiLang, 'Черновик страницы от Соавтора', 'AI Page Draft')} (${state.pageAiCandIdx + 1}/${state.pageAiCandidates.length})</strong>
+                                    <div class="pcx-actions">
+                                        <button type="button" class="pcx-btn pcx-btn-xs pcx-btn-secondary" id="pcx-fgc-prev" ${state.pageAiCandIdx <= 0 ? 'disabled' : ''}>${ICONS.chevLeft}</button>
+                                        <button type="button" class="pcx-btn pcx-btn-xs pcx-btn-secondary" id="pcx-fgc-next" ${state.pageAiCandIdx >= state.pageAiCandidates.length - 1 ? 'disabled' : ''}>${ICONS.chevRight}</button>
+                                    </div>
+                                </div>
+                                <input type="text" id="pcx-fgc-comment" class="pcx-input" value="${escapeHtml(cand.comment || '')}" placeholder="${tUi(uiLang, 'Название страницы', 'Page title')}">
+                                <input type="text" id="pcx-fgc-keys" class="pcx-input" value="${escapeHtml(cand.keys || '')}" placeholder="${tUi(uiLang, 'Ключи через запятую', 'Comma-separated keys')}">
+                                <textarea id="pcx-fgc-content" class="pcx-input" rows="5">${escapeHtml(cand.content || '')}</textarea>
+                                <div class="pcx-search-bar" style="margin:0;">
+                                    <input type="text" id="pcx-fgc-refine" class="pcx-input" placeholder="${tUi(uiLang, 'Что уточнить или исправить в черновике?...', 'What should AI refine in this draft?...')}" value="${escapeHtml(state.pageAiRefineText)}">
+                                    <button type="button" class="pcx-btn pcx-btn-secondary" id="pcx-fgc-run-refine" ${state.pageAiGenerating ? 'disabled' : ''}>${tUi(uiLang, 'Доработать', 'Refine')}</button>
+                                </div>
+                                <div class="pcx-actions pcx-end">
+                                    <button type="button" class="pcx-btn pcx-btn-secondary" id="pcx-fgc-to-manual">${tUi(uiLang, 'Перенести в ручной редактор', 'Move to Manual')}</button>
+                                    <button type="button" class="pcx-btn pcx-btn-primary" id="pcx-fgc-save-now">${ICONS.check}<span>${tUi(uiLang, 'Сохранить страницу в книгу', 'Save Page to Book')}</span></button>
+                                </div>
+                            </div>` : ''}
+                    ` : `
+                        <label class="pcx-field">
+                            <span>${tUi(uiLang, 'Название страницы', 'Page Title')}</span>
+                            <input type="text" id="pcx-fge-comment" class="pcx-input" value="${escapeHtml(d.comment || '')}" placeholder="${tUi(uiLang, 'Например: Купе №4 и ведомственный сургуч', 'e.g. Compartment #4 & Royal Wax')}">
+                        </label>
+                        <div class="pcx-field">
+                            <div class="pcx-actions pcx-between">
+                                <span>${tUi(uiLang, 'Ключевые слова (через запятую, поддерживается /regex/i)', 'Trigger Keys (comma-separated or /regex/i)')}</span>
+                                <button type="button" class="pcx-btn pcx-btn-xs pcx-btn-soft" id="pcx-fge-genkeys" ${state.keysGenerating ? 'disabled' : ''}>${state.keysGenerating ? ICONS.spinner : ICONS.spark}<span>${tUi(uiLang, 'Подобрать ключи ИИ', 'Generate Keys with AI')}</span></button>
+                            </div>
+                            <input type="text" id="pcx-fge-keys" class="pcx-input" value="${escapeHtml(keysVal)}" placeholder="купе 4, сургуч, /\\bревизор\\w*/i">
+                        </div>
+                        <div class="pcx-pair">
+                            <label class="pcx-field">
+                                <span>${tUi(uiLang, 'Режим активации', 'Trigger Mode')} ${renderHelpBtn('forge_trig')}</span>
+                                <select id="pcx-fge-trig" class="pcx-input">
+                                    <option value="keys" ${trigMode === 'keys' ? 'selected' : ''}>${tUi(uiLang, 'По ключам в чате', 'By Keywords')}</option>
+                                    <option value="const" ${trigMode === 'const' ? 'selected' : ''}>${tUi(uiLang, 'Постоянно в контексте', 'Constant')}</option>
+                                    <option value="vec" ${trigMode === 'vec' ? 'selected' : ''}>${tUi(uiLang, 'Векторизация (RAG)', 'Vectorized (RAG)')}</option>
+                                </select>
+                            </label>
+                            <label class="pcx-field">
+                                <span>${tUi(uiLang, 'Позиция World Info (0–7)', 'Position (0–7)')}</span>
+                                <select id="pcx-fge-pos" class="pcx-input">${renderPositionOptions(d.position, uiLang)}</select>
+                            </label>
                         </div>
                         ${renderHelpBubble('forge_trig')}
-                        ${pos === 4 ? `<div class="pcx-row-2"><div><label class="pcx-field-label">Глубина (0 = низ)</label><input id="pcx-fge-depth" type="number" min="0" max="999" class="pcx-input" value="${parseSafeDepth(d.depth, 0)}"></div><div><label class="pcx-field-label">Роль</label><select id="pcx-fge-role" class="pcx-select"><option value="0" ${Number(d.role) === 0 ? 'selected' : ''}>System</option><option value="1" ${Number(d.role) === 1 ? 'selected' : ''}>User</option><option value="2" ${Number(d.role) === 2 ? 'selected' : ''}>Assistant</option></select></div></div>` : ''}
-                        ${pos === 7 ? `<div><label class="pcx-field-label">${tUi(uiLang, 'Имя шлюза Outlet (для макроса {{outlet::Имя}})', 'Outlet Name (for {{outlet::Name}})')}</label><input id="pcx-fge-outlet" class="pcx-input" placeholder="LoreOutlet" value="${escapeHtml(d.outletName || '')}"></div>` : ''}
-                        <div>
-                            <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;margin-bottom:5px;flex-wrap:wrap;">
-                                <label class="pcx-field-label" style="margin:0">Содержание страницы</label>
-                                <div style="display:flex;gap:5px;">
-                                    <button type="button" class="pcx-mini-btn" id="pcx-fge-format-btn" title="Разделить слипшиеся блоки и расставить чистые отступы">${ICONS.align}<span>Отступы</span></button>
-                                    <button type="button" class="pcx-mini-btn" id="pcx-fge-import-txt">${ICONS.clip}<span>Из файла</span></button>
+                        ${Number(d.position) === 4 ? `
+                            <div class="pcx-pair">
+                                <label class="pcx-field"><span>${tUi(uiLang, 'Глубина (@ Depth, 0 = самый низ)', 'Depth (@ Depth, 0 = bottom)')}</span><input type="number" id="pcx-fge-depth" class="pcx-input" min="0" max="999" value="${parseSafeDepth(d.depth, 4)}"></label>
+                                <label class="pcx-field">
+                                    <span>${tUi(uiLang, 'Роль сообщения', 'Message Role')}</span>
+                                    <select id="pcx-fge-role" class="pcx-input">
+                                        <option value="0" ${Number(d.role) === 0 ? 'selected' : ''}>System</option>
+                                        <option value="1" ${Number(d.role) === 1 ? 'selected' : ''}>User</option>
+                                        <option value="2" ${Number(d.role) === 2 ? 'selected' : ''}>Assistant</option>
+                                    </select>
+                                </label>
+                            </div>` : ''}
+                        ${Number(d.position) === 7 ? `
+                            <label class="pcx-field">
+                                <span>${tUi(uiLang, 'Имя шлюза Outlet (для вставки в пресет через {{outlet::Имя}})', 'Outlet Name (for {{outlet::Name}})')}</span>
+                                <input type="text" id="pcx-fge-outlet" class="pcx-input" value="${escapeHtml(d.outletName || '')}" placeholder="LoreOutlet">
+                            </label>` : ''}
+                        <div class="pcx-field">
+                            <div class="pcx-actions pcx-between">
+                                <span>${tUi(uiLang, 'Содержание страницы', 'Page Content')}</span>
+                                <div class="pcx-actions">
+                                    <button type="button" class="pcx-btn pcx-btn-xs pcx-btn-secondary" id="pcx-fge-format-btn">${ICONS.align}<span>${tUi(uiLang, 'Выровнять отступы', 'Clean Paragraphs')}</span></button>
+                                    <button type="button" class="pcx-btn pcx-btn-xs pcx-btn-secondary" id="pcx-fge-import-txt">${ICONS.clip}<span>+ .txt</span></button>
+                                    <input type="file" id="pcx-fge-file-in" accept=".txt,.md" hidden>
                                 </div>
-                                <input type="file" id="pcx-fge-file-in" accept=".txt,.md,.json,.csv" style="display:none">
                             </div>
-                            <textarea id="pcx-fge-content" class="pcx-textarea" style="min-height:150px" placeholder="Текст статьи лора...">${escapeHtml(d.content)}</textarea>
+                            <textarea id="pcx-fge-content" class="pcx-input" rows="8">${escapeHtml(d.content || '')}</textarea>
                         </div>
-                        <div>
-                            <div style="display:flex;align-items:center;margin-bottom:5px;">
-                                <span class="pcx-field-label" style="margin:0">Контроль рекурсии ${renderHelpBtn('forge_recursion')}</span>
-                            </div>
-                            ${renderHelpBubble('forge_recursion')}
-                            <div class="pcx-check-grid">
-                                <label class="pcx-check-item"><input type="checkbox" id="pcx-fge-prevrec" ${d.preventRecursion ? 'checked' : ''}><span>Не будить другие страницы текстом этой статьи</span></label>
-                                <label class="pcx-check-item"><input type="checkbox" id="pcx-fge-exclrec" ${d.excludeRecursion ? 'checked' : ''}><span>Срабатывать только от чата (не от других страниц)</span></label>
-                            </div>
+                        <div class="pcx-chk-row">
+                            <label class="pcx-chk-label"><input type="checkbox" id="pcx-fge-prevrec" ${d.preventRecursion ? 'checked' : ''}><span>${tUi(uiLang, 'Не будить другие записи (prevent_recursion)', 'Prevent further recursion')}</span></label>
+                            <label class="pcx-chk-label"><input type="checkbox" id="pcx-fge-exclrec" ${d.excludeRecursion ? 'checked' : ''}><span>${tUi(uiLang, 'Не срабатывать от других записей (exclude_recursion)', 'Exclude from recursion')}</span></label>
                         </div>
-                        <div style="display:flex;justify-content:flex-end;gap:8px;"><button type="button" class="pcx-icon-btn" id="pcx-fge-cancel-2">Отмена</button><button type="button" class="pcx-primary-btn" id="pcx-fge-save" ${state.entrySavingBusy ? 'disabled' : ''}>${ICONS.check}<span>Сохранить страницу</span></button></div>
+                        <div class="pcx-actions pcx-end">
+                            <button type="button" class="pcx-btn pcx-btn-secondary" id="pcx-fge-cancel-2">${tUi(uiLang, 'Отмена', 'Cancel')}</button>
+                            <button type="button" class="pcx-btn pcx-btn-primary" id="pcx-fge-save" ${state.entrySavingBusy ? 'disabled' : ''}>${ICONS.check}<span>${tUi(uiLang, 'Сохранить страницу', 'Save Page')}</span></button>
+                        </div>
                     `}
                 </div>`;
         }
 
-        // INSIDE A LOREBOOK: Collapsible pages + Recursion Checker + Scope Pills (No Search)
+        // 6. OPEN BOOK ENTRIES (1:1 Concept renderForgeBookEntries + Organic Collapsible + Page Drag-and-Drop!)
         if (state.screen === 'book_entries' && state.activeBookData) {
-            const list = Object.values(state.activeBookData.entries || {}).sort((a, b) => Number(a.uid) - Number(b.uid));
-
-            const isAnyBound = globalList.includes(state.activeBookId) || chatBoundList.includes(state.activeBookId) || charBound === state.activeBookId;
+            const entriesObj = state.activeBookData.entries || {};
+            const list = Object.values(entriesObj).sort((a, b) => {
+                const da = Number.isFinite(Number(a?.displayIndex)) ? Number(a.displayIndex) : 999999;
+                const db = Number.isFinite(Number(b?.displayIndex)) ? Number(b.displayIndex) : 999999;
+                return da !== db ? da - db : Number(a?.uid) - Number(b?.uid);
+            });
+            const totalEntries = list.length;
             const colMap = getBookCollapsedMap(state.activeBookId);
             const allCollapsed = list.length > 0 && list.every(e => Boolean(colMap[e.uid]));
-
-            const recReport = getCachedRecursionReport(state.activeBookData.entries);
+            const isAnyBound = globalList.includes(state.activeBookId) || chatBoundList.includes(state.activeBookId) || (charBound === state.activeBookId);
+            const recReport = getCachedRecursionReport(entriesObj);
             const loopUidSet = new Set(recReport.loops.flatMap(l => l.uids.map(String)));
-            const recBadgeText = recReport.loops.length > 0
-                ? `${tUi(uiLang, 'Петель', 'Loops')}: ${recReport.loops.length}`
-                : `${tUi(uiLang, 'Рекурсия', 'Recursion')} (${recReport.totalLinks})`;
+
+            const q = state.entryQuery.trim().toLowerCase();
+            const filteredEntries = list.filter(ent => {
+                if (state.entryFilter === 'on' && ent.disable) return false;
+                if (state.entryFilter === 'off' && !ent.disable) return false;
+                if (state.entryFilter === 'const' && !ent.constant) return false;
+                if (state.entryFilter === 'keys' && (ent.constant || ent.vectorized)) return false;
+                if (state.entryFilter === 'vec' && !ent.vectorized) return false;
+                if (state.entryFilter === 'norec' && !ent.preventRecursion) return false;
+                if (state.entryFilter === 'mb' && !isMemoryBooksEntry(ent)) return false;
+                if (state.entryFilter === 'live' && !scanEntryAgainstRecentChat(ent, state.activeBookId).live) return false;
+                if (!q) return true;
+                return `${ent.comment || ''} ${(ent.key || []).join(' ')} ${ent.content || ''}`.toLowerCase().includes(q);
+            });
 
             const recursionPanelHtml = !state.showRecursionPanel ? '' : `
-                <div class="pcx-rec-panel">
-                    <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">
-                        <span style="font-size:12.5px;font-weight:800;color:var(--pcx-accent);display:inline-flex;align-items:center;">${tUi(uiLang, 'Инспектор рекурсии книги', 'Book Recursion Inspector')} ${renderHelpBtn('forge_recursion')}</span>
-                        <div style="display:flex;gap:6px;flex-wrap:wrap;">
-                            ${recReport.loops.length > 0 ? `<button type="button" class="pcx-mini-btn" style="border-color:var(--pcx-accent-2);color:var(--pcx-accent-2)" id="pcx-fg-break-loops">${ICONS.check}<span>${tUi(uiLang, 'Разорвать петли', 'Break Loops')}</span></button>` : ''}
-                            ${list.length > 0 ? `<button type="button" class="pcx-mini-btn" id="pcx-fg-toggle-all-rec">${ICONS.loop}<span>${recReport.allIsolated ? tUi(uiLang, 'Разрешить цепочки', 'Allow Chains') : tUi(uiLang, 'Изолировать все страницы', 'Isolate All Pages')}</span></button>` : ''}
+                <div class="pcx-surface pcx-panel pcx-stack" style="margin-bottom:14px;">
+                    <div class="pcx-actions pcx-between">
+                        <div>
+                            <h3>${tUi(uiLang, 'Инспектор рекурсии', 'Recursion Inspector')} · ${escapeHtml(state.activeBookId)}</h3>
+                            <small>${tUi(uiLang, 'Проверка цепочек ключей между страницами и защита от бесконечного каскада токенов.', 'Inspect keyword chains across pages and isolate cascade loops in one click.')}</small>
+                        </div>
+                        <div class="pcx-actions">
+                            ${recReport.loops.length > 0 ? `<button type="button" class="pcx-btn pcx-btn-xs pcx-btn-primary" id="pcx-fg-break-loops">${tUi(uiLang, 'Разорвать петли', 'Break Loops')}</button>` : ''}
+                            ${totalEntries > 0 ? `<button type="button" class="pcx-btn pcx-btn-xs pcx-btn-secondary" id="pcx-fg-toggle-all-rec">${recReport.allIsolated ? tUi(uiLang, 'Разрешить цепочки', 'Allow Chains') : tUi(uiLang, 'Стоп-рек. на все', 'Isolate All')}</button>` : ''}
                         </div>
                     </div>
-                    ${renderHelpBubble('forge_recursion')}
                     ${recReport.loops.length === 0 && recReport.chains.length === 0 && recReport.broadWarnings.length === 0
-                        ? `<div class="pcx-rec-item">${tUi(uiLang, 'Чисто! Ни взаимных петель, ни скрытых цепных срабатываний между страницами не обнаружено.', 'Clean! No mutual loops or hidden cascade chains detected.')}</div>`
+                        ? `<div class="pcx-guide-note">${tUi(uiLang, 'Чисто! Замкнутых петель и скрытых каскадов между страницами не обнаружено.', 'Clean! No mutual loops or hidden cascade chains detected.')}</div>`
                         : ''}
-                    ${recReport.loops.map(lp => `<div class="pcx-rec-item pcx-rec-danger"><b>${tUi(uiLang, 'Замкнутая петля:', 'Mutual Loop:')}</b> ${escapeHtml(lp.label)}</div>`).join('')}
-                    ${recReport.broadWarnings.map(w => `<div class="pcx-rec-item pcx-rec-danger"><b>${tUi(uiLang, 'Широкий ключ', 'Broad Key')} «${escapeHtml(w.key)}»</b> (${escapeHtml(w.title)}) — ${escapeHtml(w.reason)}</div>`).join('')}
-                    ${recReport.chains.slice(0, 12).map(ch => `<div class="pcx-rec-item"><b>«${escapeHtml(ch.title)}»</b> -> ${ch.targets.map(t => `«${escapeHtml(t.title)}» (${escapeHtml(t.key)})`).join(', ')}</div>`).join('')}
+                    ${recReport.loops.map(lp => `<div class="pcx-chain-step" style="border-color:var(--danger);"><strong>${tUi(uiLang, 'Замкнутая петля:', 'Mutual Loop:')}</strong><small>${escapeHtml(lp.label)}</small></div>`).join('')}
+                    ${recReport.broadWarnings.map(w => `<div class="pcx-chain-step" style="border-color:var(--gold-ink);"><strong>${tUi(uiLang, 'Широкий ключ', 'Broad Key')} «${escapeHtml(w.key)}» (${escapeHtml(w.title)})</strong><small>${escapeHtml(w.reason)}</small></div>`).join('')}
+                    ${recReport.chains.slice(0, 12).map(ch => `<div class="pcx-chain-step"><strong>«${escapeHtml(ch.title)}»</strong><small>-> ${ch.targets.map(t => `«${escapeHtml(t.title)}» (${escapeHtml(t.key)})`).join(', ')}</small></div>`).join('')}
                 </div>`;
 
-            const subbarHtml = list.length > 0 ? `
-                <div class="pcx-subbar" style="flex-wrap:wrap;">
-                    <span>${pluralizePages(list.length, uiLang)}</span>
-                    <div style="display:flex;gap:6px;">
-                        <button type="button" class="pcx-mini-btn ${state.showRecursionPanel ? 'pcx-active' : ''}" id="pcx-fg-rec-btn" style="${recReport.loops.length > 0 ? 'border-color:var(--pcx-accent-2);color:var(--pcx-accent-2)' : ''}">${ICONS.loop}<span>${escapeHtml(recBadgeText)}</span></button>
-                        <button type="button" class="pcx-mini-btn" id="pcx-fg-collapse-all">${allCollapsed ? ICONS.chevDown : ICONS.chevUp}<span>${allCollapsed ? tUi(uiLang, 'Развернуть все', 'Expand All') : tUi(uiLang, 'Свернуть все', 'Collapse All')}</span></button>
-                    </div>
-                </div>` : '';
+            const filterChips = [
+                ['all', `${tUi(uiLang, 'Все', 'All')} (${totalEntries})`],
+                ['live', tUi(uiLang, 'Сработали в чате', 'Triggered Live')],
+                ['const', tUi(uiLang, 'Постоянные', 'Constant')],
+                ['keys', tUi(uiLang, 'По ключам', 'Keyword')],
+                ['vec', tUi(uiLang, 'Векторные', 'Vector')],
+                ['norec', tUi(uiLang, 'Без рекурсии', 'No-Recursion')],
+                ['off', tUi(uiLang, 'Выключенные', 'Disabled')],
+                ...(mbStatus.installed ? [['mb', 'Memory Books']] : []),
+            ];
 
             return `
-                <div class="pcx-panel-box" style="padding:11px 12px;gap:9px;">
-                    ${state.saveError ? `<div class="pcx-err-banner"><span>${escapeHtml(state.saveError)}</span></div>` : ''}
-                    <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">
-                        <div style="display:flex;align-items:center;gap:8px;min-width:0;">
-                            <button type="button" class="pcx-mini-btn" id="pcx-fg-back-shelf">${ICONS.chevLeft}<span>${tUi(uiLang, 'Полка', 'Shelf')}</span></button>
-                            <b style="font-size:13.5px;color:var(--pcx-text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(state.activeBookId)}</b>
-                        </div>
-                        <div style="display:flex;gap:6px;flex-wrap:wrap;">
-                            <button type="button" class="pcx-secondary-btn" style="height:30px;padding:0 10px;font-size:11.5px;" id="pcx-fge-new-ai-btn">${ICONS.spark}<span>${tUi(uiLang, '+ Страница с ИИ', '+ AI Page')}</span></button>
-                            <button type="button" class="pcx-primary-btn" style="height:30px;padding:0 11px;font-size:11.5px;" id="pcx-fge-new-btn">${ICONS.plus}<span>${tUi(uiLang, 'Вручную', 'Manual')}</span></button>
-                        </div>
+                <button type="button" class="pcx-back-link" id="pcx-fg-back-shelf">${ICONS.chevLeft}<span>${tUi(uiLang, 'Назад на Полку книг', 'Back to Forge Shelf')}</span></button>
+                <div class="pcx-page-head">
+                    <div>
+                        <h1>${escapeHtml(state.activeBookId)}</h1>
+                        <p>${isAnyBound ? tUi(uiLang, 'Книга подключена и активна. Потяните за ручку слева от заголовка, чтобы менять порядок страниц и приоритет в промпте.', 'Lorebook is bound and active. Drag the grip handle on any page to adjust display & prompt insertion order.') : tUi(uiLang, 'Книга сейчас свободна на полке — включите Чат, Глобально или Персонаж ниже.', 'This Lorebook is currently unbound — toggle Chat, Global, or Char below.')}</p>
                     </div>
-                    <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">
-                        <span style="font-size:11px;color:var(--pcx-text-muted);display:inline-flex;align-items:center;">${tUi(uiLang, 'Где включена книга', 'Active Scope')} ${renderHelpBtn('forge_scope')}</span>
-                        ${renderBindPills(state.activeBookId)}
+                    <div class="pcx-actions">
+                        <button type="button" class="pcx-btn pcx-btn-soft ${state.showRecursionPanel ? 'pcx-active' : ''}" id="pcx-fg-rec-btn">${ICONS.loop}<span>${tUi(uiLang, 'Инспектор рекурсии', 'Recursion Inspector')}${recReport.loops.length ? ` (${recReport.loops.length})` : ''}</span></button>
+                        <button type="button" class="pcx-btn pcx-btn-secondary" id="pcx-fge-new-ai-btn">+ ${tUi(uiLang, 'С ИИ', 'AI Page')}</button>
+                        <button type="button" class="pcx-btn pcx-btn-primary" id="pcx-fge-new-btn">+ ${tUi(uiLang, 'Вручную', 'Manual')}</button>
                     </div>
-                    ${renderHelpBubble('forge_scope')}
-                    ${!isAnyBound ? `<div style="font-size:11px;color:var(--pcx-accent-2);">${tUi(uiLang, 'Книга сейчас выключена — нажми «Глобально», «В чат» или «Персонаж» выше.', 'This Lorebook is currently off — toggle Global, Chat, or Char above.')}</div>` : ''}
                 </div>
 
-                ${state.saveError ? `<div class="pcx-err-banner"><span>${escapeHtml(state.saveError)}</span></div>` : ''}
+                <div class="pcx-sec-route-bar">
+                    <div class="pcx-sec-route-info">
+                        <strong>${tUi(uiLang, 'Привязка тома:', 'Tome Binding:')}</strong>
+                        ${renderBindPills(state.activeBookId, { inlineMode: true })}
+                    </div>
+                </div>
+
+                ${state.saveError ? `<div class="pcx-guide-note" style="background:var(--danger-wash);color:var(--danger);margin-bottom:12px;">${escapeHtml(state.saveError)}</div>` : ''}
                 ${state.lastDeletedEntry && state.lastDeletedEntry.bookId === state.activeBookId ? `
                     <div class="pcx-undo-bar">
-                        <span>${tUi(uiLang, 'Страница удалена:', 'Page deleted:')} <b>${escapeHtml(state.lastDeletedEntry.entry.comment || ('#' + state.lastDeletedEntry.uid))}</b></span>
-                        <button type="button" class="pcx-mini-btn" id="pcx-fg-undo-del">${ICONS.undo}<span>${tUi(uiLang, 'Вернуть', 'Undo')}</span></button>
+                        <span>${tUi(uiLang, 'Страница удалена:', 'Page deleted:')} <strong>${escapeHtml(state.lastDeletedEntry.entry.comment || ('#' + state.lastDeletedEntry.uid))}</strong></span>
+                        <button type="button" class="pcx-btn pcx-btn-xs pcx-btn-secondary" id="pcx-fg-undo-del">${ICONS.undo}<span>${tUi(uiLang, 'Вернуть', 'Undo')}</span></button>
                     </div>` : ''}
-                ${list.length > 0 ? `
-                    <div class="pcx-search-bar">
-                        <div class="pcx-search-wrap">
-                            <span class="pcx-search-icon">${ICONS.search}</span>
-                            <input type="text" id="pcx-fg-entry-search" class="pcx-search-input" placeholder="${tUi(uiLang, 'Поиск по названию, ключам и тексту...', 'Search title, trigger keys, or text...')}" value="${escapeHtml(state.entryQuery)}">
-                            ${state.entryQuery ? `<button type="button" class="pcx-search-clear" id="pcx-fg-entry-search-clear">${ICONS.close}</button>` : ''}
-                        </div>
-                        <div class="pcx-filter-strip">
-                            ${[
-                                ['all', tUi(uiLang, 'Все', 'All')],
-                                ['on', tUi(uiLang, 'Вкл', 'Active')],
-                                ['off', tUi(uiLang, 'Выкл', 'Muted')],
-                                ['live', tUi(uiLang, 'В чате / промпте', 'Triggered')],
-                                ['const', tUi(uiLang, 'Постоянные', 'Constant')],
-                                ['nokeys', tUi(uiLang, 'Без ключей', 'No Keys')],
-                            ].map(([fid, flabel]) => `<button type="button" class="pcx-filter-chip ${state.entryFilter === fid ? 'pcx-active' : ''}" data-fg-efilter="${fid}">${flabel}</button>`).join('')}
-                        </div>
-                    </div>` : ''}
-                ${subbarHtml}
+
                 ${recursionPanelHtml}
 
-                ${(() => {
-                    const q = state.entryQuery.trim().toLowerCase();
-                    const filteredList = list.filter(ent => {
-                        if (state.entryFilter === 'on' && ent.disable) return false;
-                        if (state.entryFilter === 'off' && !ent.disable) return false;
-                        if (state.entryFilter === 'const' && !ent.constant) return false;
-                        if (state.entryFilter === 'nokeys' && (ent.constant || (Array.isArray(ent.key) && ent.key.some(k => String(k).trim())))) return false;
-                        if (state.entryFilter === 'live' && !scanEntryAgainstRecentChat(ent, state.activeBookId).live) return false;
-                        if (!q) return true;
-                        const hay = `${ent.comment || ''} \n ${(ent.key || []).join(' ')} \n ${(ent.keysecondary || []).join(' ')} \n ${ent.content || ''}`.toLowerCase();
-                        return hay.includes(q);
-                    });
-                    if (list.length === 0) return true;
-                    if (filteredList.length === 0) return 'NO_MATCH';
-                    list.length = 0;
-                    list.push(...filteredList);
-                    return false;
-                })() === 'NO_MATCH' ? `<div class="pcx-empty">${tUi(uiLang, 'По текущему фильтру или запросу страниц не найдено.', 'No pages match your current search or filter.')}</div>` : list.length === 0 ? `<div class="pcx-empty">${tUi(uiLang, 'В книге пока нет страниц.<br>Нажми <b>«+ Страница с ИИ»</b> или <b>«+ Вручную»</b>!', 'No pages in this Lorebook yet.<br>Tap <b>+ AI Page</b> or <b>+ Manual</b>!')}</div>` : list.map(ent => {
-                    const isOn = !ent.disable;
-                    const isCol = Boolean(colMap[ent.uid]);
-                    const modeTag = ent.constant ? tUi(uiLang, 'Постоянно', 'Constant') : (ent.vectorized ? tUi(uiLang, 'Вектор', 'Vector') : tUi(uiLang, 'По ключам', 'Keywords'));
-                    const keysArr = Array.isArray(ent.key) ? ent.key.map(k => String(k).trim()).filter(Boolean) : [];
-                    const scanInfo = scanEntryAgainstRecentChat(ent);
-                    const hitSet = new Set(scanInfo.hitKeys);
-                    const outLinks = recReport.outMap[ent.uid] || [];
-                    const hasLoop = loopUidSet.has(String(ent.uid));
+                ${totalEntries > 0 ? `
+                    <div class="pcx-search-bar">
+                        <input type="search" id="pcx-fg-entry-search" class="pcx-input" placeholder="${tUi(uiLang, 'Поиск страницы по названию, ключам или тексту...', 'Search pages by title, keys, or lore...')}" value="${escapeHtml(state.entryQuery)}">
+                        <button type="button" class="pcx-btn pcx-btn-secondary" id="pcx-fg-collapse-all">${allCollapsed ? tUi(uiLang, 'Развернуть все', 'Expand All') : tUi(uiLang, 'Свернуть все', 'Collapse All')}</button>
+                    </div>
+                    <div class="pcx-carousel-row">
+                        ${filterChips.map(([fid, lbl]) => `<button type="button" class="pcx-chip ${state.entryFilter === fid ? 'pcx-active' : ''}" data-fg-efilter="${fid}">${escapeHtml(lbl)}</button>`).join('')}
+                    </div>
+                ` : ''}
 
-                    const safeUid = escapeHtml(String(ent.uid));
-                    return `
-                        <div class="pcx-card ${isOn ? '' : 'pcx-card-off'} ${isCol ? 'pcx-collapsed' : ''}">
-                            <div class="pcx-card-top">
-                                <div class="pcx-card-title-group">
-                                    <div class="pcx-switch ${isOn ? 'pcx-on' : ''}" data-fg-toggle="${safeUid}"></div>
-                                    <div class="pcx-card-title" data-fg-collapse="${safeUid}">${escapeHtml(ent.comment || (tUi(uiLang, 'Страница #', 'Page #') + String(ent.uid)))}</div>
-                                </div>
-                                <div style="display:flex;align-items:center;gap:5px;flex-shrink:0;">
-                                    ${ent.stmemorybooks === true ? `<span class="pcx-prio-badge">Memory</span>` : ''}
-                                    ${hasLoop ? `<span class="pcx-prio-badge" style="color:#ff5c77">${tUi(uiLang, 'Петля', 'Loop')}</span>` : ''}
-                                    ${ent.preventRecursion ? `<span class="pcx-prio-badge">${tUi(uiLang, 'Без каскада', 'Isolated')}</span>` : ''}
-                                    ${isCol && keysArr.length > 0 ? `<span class="pcx-prio-badge">${keysArr.length} ${tUi(uiLang, 'кл.', 'keys')}</span>` : ''}
-                                    <span class="pcx-prio-badge">${modeTag}</span>
-                                    <button type="button" class="pcx-collapse-btn" data-fg-collapse="${safeUid}" title="${isCol ? tUi(uiLang, 'Развернуть запись', 'Expand entry') : tUi(uiLang, 'Свернуть запись', 'Collapse entry')}">${isCol ? ICONS.chevDown : ICONS.chevUp}</button>
-                                </div>
-                            </div>
-                            ${!isCol ? `
-                                ${keysArr.length > 0 ? `<div class="pcx-key-chips">${keysArr.map(k => `<span class="pcx-key-chip ${hitSet.has(k) ? 'pcx-key-hit' : ''}">${ICONS.key}<span>${escapeHtml(k)}</span></span>`).join('')}</div>` : ''}
-                                <div class="pcx-scan-bar ${scanInfo.live && isAnyBound ? 'pcx-scan-live' : ''}">
-                                    <span>${escapeHtml(scanInfo.label)}</span>
-                                </div>
-                                ${outLinks.length > 0 ? `<div class="pcx-rec-note">${hasLoop ? `<b>${tUi(uiLang, 'Взаимная петля рекурсии!', 'Mutual recursion loop!')}</b> ` : ''}${tUi(uiLang, 'Цепляет по рекурсии:', 'Triggers via recursion:')} ${outLinks.map(o => `«${escapeHtml(o.title)}» (${escapeHtml(o.key)})`).join(', ')}</div>` : ''}
-                                <div class="pcx-card-content" style="max-height:145px">${escapeHtml(ent.content || '')}</div>
-                                <div class="pcx-card-footer">
-                                    <button type="button" class="pcx-mini-btn" data-fg-norec="${safeUid}" title="Запретить тексту этой страницы будить другие страницы">${ICONS.loop}<span>${ent.preventRecursion ? tUi(uiLang, 'Изолирована', 'Isolated') : tUi(uiLang, 'Рекурсия', 'Recursion')}</span></button>
-                                    <button type="button" class="pcx-mini-btn" data-fg-vec="${safeUid}">${ICONS.vector}<span>${ent.vectorized ? tUi(uiLang, 'Вектор: ВКЛ', 'Vector: ON') : tUi(uiLang, 'Вектор', 'Vector')}</span></button>
-                                    <button type="button" class="pcx-mini-btn" data-fg-ai-edit="${safeUid}">${ICONS.spark}<span>${tUi(uiLang, 'С ИИ', 'AI')}</span></button>
-                                    <button type="button" class="pcx-mini-btn" data-fg-edit="${safeUid}">${ICONS.edit}<span>${tUi(uiLang, 'Править', 'Edit')}</span></button>
-                                    <button type="button" class="pcx-mini-btn" data-fg-del="${safeUid}">${ICONS.trash}</button>
-                                </div>
-                            ` : ''}
-                        </div>`;
-                }).join('')}`;
+                <div class="pcx-stack">
+                    ${totalEntries === 0
+                        ? `<div class="pcx-surface pcx-panel"><small>${tUi(uiLang, 'В этой книге пока нет страниц. Нажмите «+ С ИИ» или «+ Вручную» выше.', 'No pages in this Lorebook yet. Tap "+ AI Page" or "+ Manual" above.')}</small></div>`
+                        : (filteredEntries.length === 0
+                            ? `<div class="pcx-surface pcx-panel"><small>${tUi(uiLang, 'По выбранному фильтру страниц не найдено.', 'No pages match your current filter.')}</small></div>`
+                            : filteredEntries.map(ent => {
+                                const isOn = !ent.disable;
+                                const isCol = Boolean(colMap[ent.uid]);
+                                const safeUid = escapeHtml(String(ent.uid));
+                                const keysArr = Array.isArray(ent.key) ? ent.key.map(k => String(k).trim()).filter(Boolean) : [];
+                                const scanInfo = scanEntryAgainstRecentChat(ent, state.activeBookId);
+                                const hasLoop = loopUidSet.has(String(ent.uid));
+                                const posNum = Number(ent.position ?? 0);
+                                const roleNames = { 0: 'System', 1: 'User', 2: 'Assistant' };
+                                const posShort = posNum === 4
+                                    ? `@ Depth ${parseSafeDepth(ent.depth, 4)} · ${roleNames[Number(ent.role) || 0] || 'System'}`
+                                    : (posNum === 7 ? `Outlet {{${ent.outletName || 'Lore'}}}` : `WI Pos ${posNum}`);
+
+                                return `
+                                    <article class="pcx-entry-row ${scanInfo.live && isOn && isAnyBound ? 'pcx-fired' : ''} ${!isOn ? 'pcx-disabled-card' : ''} ${!isCol ? 'pcx-is-open' : ''}" data-fg-entry-uid="${safeUid}">
+                                        <div class="pcx-entry-top">
+                                            <div class="pcx-note-title-wrap">
+                                                <span class="pcx-drag-grip pcx-fg-entry-grip" title="${tUi(uiLang, 'Потяните, чтобы изменить порядок страницы в промпте', 'Drag to reorder page')}">${ICONS.grip}</span>
+                                                <button type="button" class="pcx-note-title-btn" data-fg-collapse="${safeUid}">
+                                                    <span class="pcx-note-title-text">${escapeHtml(ent.comment || (tUi(uiLang, 'Страница #', 'Page #') + String(ent.uid)))}</span>
+                                                    ${ent.constant ? `<span class="pcx-status-badge pcx-warm">${tUi(uiLang, 'Пост.', 'Const')}</span>` : ''}
+                                                    ${ent.vectorized ? `<span class="pcx-status-badge pcx-warm">${tUi(uiLang, 'Вектор', 'Vec')}</span>` : ''}
+                                                    ${scanInfo.live && isOn && isAnyBound ? `<span class="pcx-status-badge">${tUi(uiLang, 'В сцене', 'Live')}</span>` : ''}
+                                                    ${mbStatus.installed && isMemoryBooksEntry(ent) ? `<span class="pcx-key-badge">MB</span>` : ''}
+                                                    ${hasLoop ? `<span class="pcx-status-badge pcx-danger">${tUi(uiLang, 'Петля', 'Loop')}</span>` : ''}
+                                                </button>
+                                            </div>
+                                            <div class="pcx-actions">
+                                                <button type="button" class="pcx-chip ${ent.preventRecursion ? 'pcx-active' : ''}" data-fg-norec="${safeUid}" title="${tUi(uiLang, 'Запретить будить другие записи (prevent_recursion)', 'Prevent recursion')}">${tUi(uiLang, 'Стоп-рек.', 'No-Rec')}</button>
+                                                <button type="button" class="pcx-sq-switch" role="switch" aria-checked="${isOn}" data-fg-toggle="${safeUid}" title="${tUi(uiLang, 'Вкл / Выкл страницу', 'Toggle page')}"><span></span></button>
+                                            </div>
+                                        </div>
+                                        ${!isCol ? `
+                                            <div class="pcx-chip-row">
+                                                ${keysArr.map(k => `<span class="pcx-key-badge">${escapeHtml(k)}</span>`).join('')}
+                                                <small>· ${escapeHtml(posShort)}</small>
+                                            </div>
+                                            <div class="pcx-note-text-preview">${escapeHtml(ent.content || '')}</div>
+                                            <div class="pcx-actions pcx-between" style="padding-top:8px;border-top:1px solid var(--line);">
+                                                <div class="pcx-actions">
+                                                    <button type="button" class="pcx-btn pcx-btn-xs pcx-btn-secondary" data-fg-edit="${safeUid}">${tUi(uiLang, 'Править вручную', 'Edit')}</button>
+                                                    <button type="button" class="pcx-btn pcx-btn-xs pcx-btn-soft" data-fg-ai-edit="${safeUid}">${tUi(uiLang, 'Доработать с ИИ', 'AI Edit')}</button>
+                                                    <button type="button" class="pcx-btn pcx-btn-xs pcx-btn-secondary" data-fg-vec="${safeUid}">${ent.vectorized ? 'RAG: ON' : 'RAG'}</button>
+                                                </div>
+                                                <button type="button" class="pcx-btn pcx-btn-xs pcx-btn-danger-ghost" data-fg-del="${safeUid}">${tUi(uiLang, 'Удалить', 'Delete')}</button>
+                                            </div>
+                                        ` : ''}
+                                    </article>`;
+                            }).join(''))}
+                </div>`;
         }
 
-        // BOOKSHELF (No Search)
+        // 7. LOREBOOK SHELF WITH 2 / 2.65 COVERS (1:1 Concept renderForgeShelf!)
         const sortedBooks = [...state.books].sort((a, b) => {
             const aActive = globalList.includes(a.file_id) || chatBoundList.includes(a.file_id) || charBound === a.file_id ? 1 : 0;
             const bActive = globalList.includes(b.file_id) || chatBoundList.includes(b.file_id) || charBound === b.file_id ? 1 : 0;
@@ -2009,78 +2321,110 @@ export function createForgeController(deps) {
 
         const shelfQ = state.shelfQuery.trim().toLowerCase();
         const visibleBooks = sortedBooks.filter(b => {
-            const isBound = globalList.includes(b.file_id) || chatBoundList.includes(b.file_id) || charBound === b.file_id;
+            const isGlob = globalList.includes(b.file_id);
+            const isChat = chatBoundList.includes(b.file_id);
+            const isChar = charBound === b.file_id;
+            const isBound = isGlob || isChat || isChar;
+            const isMb = Boolean(mbStatus.installed && mbStatus.enabled && mbStatus.targetBook && mbStatus.targetBook === b.file_id);
+            if (state.shelfFilter === 'chat' && !isChat) return false;
+            if (state.shelfFilter === 'global' && !isGlob) return false;
+            if (state.shelfFilter === 'char' && !isChar) return false;
             if (state.shelfFilter === 'bound' && !isBound) return false;
             if (state.shelfFilter === 'unbound' && isBound) return false;
+            if (state.shelfFilter === 'mb' && !isMb) return false;
             if (!shelfQ) return true;
             return String(b.name || b.file_id).toLowerCase().includes(shelfQ);
         });
 
+        const shelfFilters = [
+            ['all', tUi(uiLang, 'Все книги', 'All Books')],
+            ['chat', tUi(uiLang, 'Привязаны в Чат', 'In This Chat')],
+            ['global', tUi(uiLang, 'Глобальные', 'Global')],
+            ['char', tUi(uiLang, 'К Персонажу', 'Character')],
+            ['unbound', tUi(uiLang, 'Свободные на полке', 'Unbound')],
+            ...(mbStatus.installed ? [['mb', 'Memory Books']] : []),
+        ];
+
+        const mbStripHtml = !mbStatus.installed ? '' : `
+            <div class="pcx-status-strip">
+                <span class="pcx-live-pill">
+                    ${ICONS.memory}
+                    <span><strong>Memory Books:</strong> ${!mbStatus.enabled
+                        ? tUi(uiLang, 'сейчас выключен в Таверне', 'currently disabled in ST')
+                        : (!stApi.isChatOpen()
+                            ? tUi(uiLang, 'откройте чат, чтобы назначить том памяти', 'open a chat to assign target tome')
+                            : (mbStatus.targetBook
+                                ? `${tUi(uiLang, 'пишет память в том', 'target tome')} «${escapeHtml(mbStatus.targetBook)}»`
+                                : tUi(uiLang, 'нажмите «Memory Books» на нужной книге ниже', 'tap Memory Books on any tome below')))}</span>
+                </span>
+            </div>`;
+
         return `
-            <div class="pcx-forge-toolbar">
-                <div class="pcx-forge-toprow">
-                    <span style="font-size:13.5px;font-weight:800;color:var(--pcx-text);display:inline-flex;align-items:center;">${tUi(uiLang, 'Полка Лорбуков', 'Lorebook Shelf')} (${state.books.length}) ${renderHelpBtn('forge_shelf')}</span>
-                    <div style="display:flex;gap:6px;">
-                        <button type="button" class="pcx-icon-btn" id="pcx-fg-new-manual-btn">${ICONS.plus}<span>${tUi(uiLang, 'Пустой том', 'New Tome')}</span></button>
-                        <button type="button" class="pcx-primary-btn" style="height:33px;padding:0 13px;font-size:12px;" id="pcx-fg-open-hub-btn">${ICONS.forge}<span>${tUi(uiLang, 'Создать / Выковать', 'Create / Forge')}</span></button>
-                    </div>
+            ${mbStripHtml}
+            <div class="pcx-page-head">
+                <div>
+                    <h1>${tUi(uiLang, 'Кузница Лорбуков', 'Lorebook Forge')}</h1>
+                    <p>${tUi(uiLang, 'Управляйте привязкой каждого тома прямо с обложки (Чат / Глобально / Персонаж), меняйте обложки и куйте новые миры без риска затереть живые записи.', 'Toggle Chat, Global, and Character bindings directly on each cover, attach lossless cover art, or forge new worlds.')}</p>
                 </div>
-                ${renderHelpBubble('forge_shelf')}
-                ${state.books.length > 1 ? `
-                    <div class="pcx-search-bar" style="margin-top:6px;">
-                        <div class="pcx-search-wrap">
-                            <span class="pcx-search-icon">${ICONS.search}</span>
-                            <input type="text" id="pcx-fg-shelf-search" class="pcx-search-input" placeholder="${tUi(uiLang, 'Быстрый фильтр книг по названию...', 'Filter Lorebooks by title...')}" value="${escapeHtml(state.shelfQuery)}">
-                            ${state.shelfQuery ? `<button type="button" class="pcx-search-clear" id="pcx-fg-shelf-search-clear">${ICONS.close}</button>` : ''}
-                        </div>
-                        <div class="pcx-filter-strip">
-                            ${[
-                                ['all', tUi(uiLang, 'Все книги', 'All Books')],
-                                ['bound', tUi(uiLang, 'Подключённые', 'Active / Bound')],
-                                ['unbound', tUi(uiLang, 'На полке (выкл)', 'Unbound')],
-                            ].map(([fid, flabel]) => `<button type="button" class="pcx-filter-chip ${state.shelfFilter === fid ? 'pcx-active' : ''}" data-fg-sfilter="${fid}">${flabel}</button>`).join('')}
-                        </div>
-                    </div>` : ''}
+                <div class="pcx-actions">
+                    <button type="button" class="pcx-btn pcx-btn-secondary" id="pcx-fg-new-manual-btn">+ ${tUi(uiLang, 'Пустой том', 'Blank Tome')}</button>
+                    <button type="button" class="pcx-btn pcx-btn-primary" id="pcx-fg-open-hub-btn">${tUi(uiLang, 'Выковать / Добавить...', 'Forge / Create...')}</button>
+                </div>
             </div>
 
-            ${state.loading && state.books.length === 0 ? `<div class="pcx-empty">${tUi(uiLang, 'Открываем архивы Лорбуков Таверны...', 'Loading Lorebooks...')}</div>` : (
-                sortedBooks.length === 0
-                    ? `<div class="pcx-empty">${tUi(uiLang, 'На полке пока нет Лорбуков.<br>Нажми <b>«Создать / Выковать»</b>!', 'No Lorebooks yet.<br>Tap <b>Create / Forge</b>!')}</div>`
-                    : (visibleBooks.length === 0
-                        ? `<div class="pcx-empty">${tUi(uiLang, 'Книг по запросу не найдено.', 'No matching Lorebooks found.')}</div>`
-                        : `<div class="pcx-book-grid">${visibleBooks.map(b => {
-                        const isGlob = globalList.includes(b.file_id);
-                        const isChat = chatBoundList.includes(b.file_id);
-                        const isChar = charBound === b.file_id;
-                        const isAny = isGlob || isChat || isChar;
-                        const cover = sanitizeCoverDataUrl(b.extensions?.pocket_codex_cover);
-                        const cnt = state.bookCounts[b.file_id];
-                        const countLabel = cnt !== undefined ? pluralizePages(cnt, uiLang) : tUi(uiLang, 'Том знаний', 'Lore Tome');
+            <div class="pcx-search-bar">
+                <input type="search" id="pcx-fg-shelf-search" class="pcx-input" placeholder="${tUi(uiLang, 'Поиск книги на полке...', 'Search Lorebooks on shelf...')}" value="${escapeHtml(state.shelfQuery)}">
+                <span class="pcx-live-pill">${state.books.length} ${tUi(uiLang, 'кн.', 'books')}</span>
+            </div>
 
-                        return `
-                            <div class="pcx-tome-card ${isAny ? 'pcx-book-bound' : ''}">
-                                <div class="pcx-tome-main">
-                                    <div class="pcx-book-cover" data-fg-cover="${escapeHtml(b.file_id)}" title="Сменить Арт-обложку">
-                                        ${cover ? `<img src="${escapeHtml(cover)}">` : `${ICONS.forge}<span class="pcx-cover-hint">${tUi(uiLang, 'ОБЛОЖКА', 'COVER')}</span>`}
-                                    </div>
-                                    <div class="pcx-book-info">
-                                        <div>
-                                            <div class="pcx-book-title" data-fg-open="${escapeHtml(b.file_id)}">${escapeHtml(b.name)}</div>
-                                            <div class="pcx-book-meta"><span>${escapeHtml(countLabel)}</span>${isAny ? `<span style="color:var(--pcx-accent)">• ${tUi(uiLang, 'АКТИВЕН', 'ACTIVE')}</span>` : ''}</div>
+            <div class="pcx-carousel-row">
+                ${shelfFilters.map(([fid, lbl]) => `<button type="button" class="pcx-chip ${state.shelfFilter === fid ? 'pcx-active' : ''}" data-fg-sfilter="${fid}">${escapeHtml(lbl)}</button>`).join('')}
+            </div>
+
+            ${state.loading && state.books.length === 0
+                ? `<div class="pcx-surface pcx-panel"><small>${tUi(uiLang, 'Открываем полку Лорбуков Таверны...', 'Loading Lorebooks...')}</small></div>`
+                : (sortedBooks.length === 0
+                    ? `<div class="pcx-surface pcx-panel"><small>${tUi(uiLang, 'На полке пока нет Лорбуков. Нажмите «Выковать / Добавить...» выше.', 'No Lorebooks yet. Tap "Forge / Create..." above.')}</small></div>`
+                    : (visibleBooks.length === 0
+                        ? `<div class="pcx-surface pcx-panel"><small>${tUi(uiLang, 'Книг по запросу не найдено.', 'No matching Lorebooks found.')}</small></div>`
+                        : `<div class="pcx-shelf-grid">${visibleBooks.map(b => {
+                            const isGlob = globalList.includes(b.file_id);
+                            const isChat = chatBoundList.includes(b.file_id);
+                            const isChar = charBound === b.file_id;
+                            const isMbBook = Boolean(mbStatus.installed && mbStatus.enabled && mbStatus.targetBook && mbStatus.targetBook === b.file_id);
+                            const anyBound = isGlob || isChat || isChar || isMbBook;
+                            const cnt = state.bookCounts[b.file_id];
+                            const cntTag = cnt !== undefined ? `${cnt} ${tUi(uiLang, 'стр.', 'p.')}` : tUi(uiLang, 'Том', 'Tome');
+                            const statusSub = [
+                                isChat ? tUi(uiLang, 'В чате', 'In Chat') : '',
+                                isGlob ? tUi(uiLang, 'Глобально', 'Global') : '',
+                                isChar ? tUi(uiLang, 'Персонаж', 'Char') : '',
+                                isMbBook ? 'Memory Books' : '',
+                            ].filter(Boolean).join(' · ') || tUi(uiLang, 'Свободен на полке', 'Unbound on shelf');
+
+                            return `
+                                <article class="pcx-book-card ${anyBound ? 'pcx-bound' : ''}">
+                                    <div class="pcx-book-cover" data-fg-open="${escapeHtml(b.file_id)}">
+                                        ${renderBookCoverGraphic(b.file_id, b.name, b.extensions?.pocket_codex_cover, cnt, uiLang)}
+                                        <div class="pcx-cover-top-bar">
+                                            <span class="pcx-cover-tag">${escapeHtml(cntTag)}</span>
+                                            ${anyBound ? `<span class="pcx-cover-tag pcx-active-hit">${tUi(uiLang, 'Активен', 'Active')}</span>` : ''}
                                         </div>
-                                        ${renderBindPills(b.file_id)}
+                                        <button type="button" class="pcx-cover-art-btn" data-fg-cover="${escapeHtml(b.file_id)}">${tUi(uiLang, 'Обложка', 'Cover')}</button>
                                     </div>
-                                </div>
-                                <div class="pcx-tome-footer">
-                                    <div style="display:flex;gap:5px;flex-wrap:wrap;">
-                                        <button type="button" class="pcx-mini-btn" data-fg-open="${escapeHtml(b.file_id)}">${ICONS.book}<span>${tUi(uiLang, 'Страницы', 'Pages')}</span></button>
-                                        <button type="button" class="pcx-mini-btn" data-fg-quick-ai="${escapeHtml(b.file_id)}">${ICONS.spark}<span>${tUi(uiLang, '+ С ИИ', '+ AI Page')}</span></button>
+                                    <div class="pcx-book-meta" data-fg-open="${escapeHtml(b.file_id)}">
+                                        <strong>${escapeHtml(b.name)}</strong>
+                                        <small>${escapeHtml(statusSub)}</small>
                                     </div>
-                                    <button type="button" class="pcx-mini-btn" data-fg-delbook="${escapeHtml(b.file_id)}" title="Удалить Лорбук">${ICONS.trash}</button>
-                                </div>
-                            </div>`;
-                    }).join('')}</div><input type="file" id="pcx-fg-shelf-cover-in" accept="image/*" style="display:none">`)
-            )}`;
+                                    ${renderBindPills(b.file_id)}
+                                    <div class="pcx-book-foot">
+                                        <button type="button" class="pcx-btn pcx-btn-sm pcx-btn-primary pcx-btn-main-open" data-fg-open="${escapeHtml(b.file_id)}">${tUi(uiLang, 'Открыть', 'Open')}</button>
+                                        <button type="button" class="pcx-btn pcx-btn-sm pcx-btn-soft" data-fg-quick-ai="${escapeHtml(b.file_id)}" title="${tUi(uiLang, 'Быстро добавить страницу с ИИ', 'Quick AI Page')}">+ ИИ</button>
+                                        <button type="button" class="pcx-btn pcx-btn-sm pcx-btn-danger-ghost" data-fg-delbook="${escapeHtml(b.file_id)}" title="${tUi(uiLang, 'Удалить том', 'Delete Tome')}">×</button>
+                                    </div>
+                                </article>`;
+                        }).join('')}</div><input type="file" id="pcx-fg-shelf-cover-in" accept="image/*" hidden>`))}
+        `;
     }
 
     function captureEntryFields(win) {
@@ -2164,6 +2508,19 @@ export function createForgeController(deps) {
             if (scope === 'global') await stApi.toggleGlobalLorebook?.(bookId);
             else if (scope === 'chat') await toggleBindBookToChat(bookId);
             else if (scope === 'char') await stApi.toggleCharLorebook?.(bookId);
+            else if (scope === 'memory') {
+                const res = await stApi.assignMemoryBook?.(bookId);
+                if (res && !res.ok && res.reason === 'locked') {
+                    const uiLang = s.uiLang || 'ru';
+                    window.alert(tUi(
+                        uiLang,
+                        `Для этого персонажа включён замок на Лорбук «${res.targetBook}» в настройках Memory Books. Снимите замок в Memory Books, чтобы менять книгу свободно.`,
+                        `This character is locked to Lorebook "${res.targetBook}" inside Memory Books settings.`
+                    ));
+                } else if (res?.ok && res.active) {
+                    try { window.toastr?.success?.(`Книга «${bookId}» назначена приёмником для Memory Books!`); } catch {}
+                }
+            }
             requestRender({ preserveBodyScroll: true });
         }));
 
@@ -2173,7 +2530,7 @@ export function createForgeController(deps) {
         win.querySelector('#pcx-fg-newcover-pick')?.addEventListener('click', () => win.querySelector('#pcx-fg-newcover-input')?.click());
         win.querySelector('#pcx-fg-newcover-input')?.addEventListener('change', async e => {
             const f = e.target.files?.[0]; if (!f) return;
-            state.newBookCover = (await compressImageFile(f, 520, 0.82)).dataUrl; requestRender();
+            try { state.newBookCover = (await readImageFileLossless(f)).dataUrl; requestRender(); } catch (err) { window.alert(err?.message || String(err)); }
         });
         win.querySelector('#pcx-fg-shelf-search')?.addEventListener('input', e => {
             state.shelfQuery = e.target.value;
@@ -2285,10 +2642,13 @@ export function createForgeController(deps) {
                     try { window.toastr?.warning?.(postNotice); } catch {}
                 }
                 await fetchBooksList();
-                state.activeBookId = sanitized; state.activeBookData = saved; state.saveError = postNotice; state.screen = 'book_entries'; requestRender();
+                state.activeBookId = sanitized; state.activeBookData = saved; state.saveError = postNotice; state.screen = 'book_entries';
+                state.manualCreateBusy = false;
+                requestRender();
             } catch (err) {
                 const msg = tUi(uiLang, 'Не удалось проверить или создать Лорбук: ', 'Failed to verify or create Lorebook: ') + (err?.message || String(err));
                 state.saveError = msg;
+                state.manualCreateBusy = false;
                 try { window.toastr?.error?.(msg); } catch {}
                 window.alert(msg);
                 requestRender({ preserveBodyScroll: true });
@@ -2338,14 +2698,15 @@ export function createForgeController(deps) {
         }));
 
         let coverTargetBookId = '';
-        win.querySelectorAll('[data-fg-cover]').forEach(el => el.addEventListener('click', () => {
+        win.querySelectorAll('[data-fg-cover]').forEach(el => el.addEventListener('click', e => {
+            e.preventDefault(); e.stopPropagation();
             coverTargetBookId = el.dataset.fgCover;
             win.querySelector('#pcx-fg-shelf-cover-in')?.click();
         }));
         win.querySelector('#pcx-fg-shelf-cover-in')?.addEventListener('change', async e => {
             const f = e.target.files?.[0]; if (!f || !coverTargetBookId) return;
             try {
-                const att = await compressImageFile(f, 520, 0.82);
+                const att = await readImageFileLossless(f);
                 const safeCover = sanitizeCoverDataUrl(att.dataUrl);
                 if (!safeCover) throw new Error('Неподдерживаемый формат обложки (разрешены локальные PNG, JPEG, WebP и GIF).');
                 await mutateBookAtomically(coverTargetBookId, (fresh) => {
@@ -2542,19 +2903,22 @@ export function createForgeController(deps) {
                 requestRender({ preserveBodyScroll: true });
             });
 
-            // Single Page AI Preset, Word Count & Prompt Editor
+            // Single Page AI Preset, Custom Presets, Word Count & Prompt Editor
             win.querySelector('#pcx-fgp-preset')?.addEventListener('change', e => {
                 captureEntryFields(win);
-                const chosen = FORGE_BOOK_PRESETS.find(p => p.id === e.target.value) || FORGE_BOOK_PRESETS[0];
+                const allPr = getAllForgeBookPresets();
+                const chosen = allPr.find(p => p.id === e.target.value) || allPr[0];
                 s.forgePresetId = chosen.id;
                 s.forgePageSystemPrompt = chosen.pagePrompt;
                 s.forgeBookSystemPrompt = chosen.bookPrompt;
+                state.showCustomForgePresetBox = false;
                 stApi.saveSettings();
                 requestRender({ preserveBodyScroll: true });
             });
             win.querySelector('#pcx-fgp-toggle-prompt')?.addEventListener('click', () => {
                 captureEntryFields(win);
                 state.showPagePromptEditor = !state.showPagePromptEditor;
+                state.showCustomForgePresetBox = false;
                 requestRender({ preserveBodyScroll: true });
             });
             win.querySelector('#pcx-fgp-reset-prompt')?.addEventListener('click', () => {
@@ -2609,16 +2973,78 @@ export function createForgeController(deps) {
 
         win.querySelector('#pcx-fg-book-preset')?.addEventListener('change', e => {
             captureEntryFields(win);
-            const chosen = FORGE_BOOK_PRESETS.find(p => p.id === e.target.value) || FORGE_BOOK_PRESETS[0];
+            const allPr = getAllForgeBookPresets();
+            const chosen = allPr.find(p => p.id === e.target.value) || allPr[0];
             s.forgePresetId = chosen.id;
             s.forgeBookSystemPrompt = chosen.bookPrompt;
             s.forgePageSystemPrompt = chosen.pagePrompt;
+            state.showCustomForgePresetBox = false;
             stApi.saveSettings();
             requestRender({ preserveBodyScroll: true });
         });
         win.querySelector('#pcx-fg-toggle-book-prompt')?.addEventListener('click', () => {
             captureEntryFields(win);
             state.showBookPromptEditor = !state.showBookPromptEditor;
+            state.showCustomForgePresetBox = false;
+            requestRender({ preserveBodyScroll: true });
+        });
+        win.querySelector('#pcx-fg-open-custom-preset')?.addEventListener('click', () => {
+            captureEntryFields(win);
+            state.showCustomForgePresetBox = !state.showCustomForgePresetBox;
+            requestRender({ preserveBodyScroll: true });
+        });
+        win.querySelector('#pcx-fg-cancel-custom-preset')?.addEventListener('click', () => {
+            captureEntryFields(win);
+            state.showCustomForgePresetBox = false;
+            requestRender({ preserveBodyScroll: true });
+        });
+        win.querySelector('#pcx-fg-custom-name')?.addEventListener('input', e => { state.customForgeNameDraft = e.target.value; });
+        win.querySelector('#pcx-fg-custom-ph')?.addEventListener('input', e => { state.customForgePhDraft = e.target.value; });
+        win.querySelector('#pcx-fg-save-custom-preset')?.addEventListener('click', () => {
+            captureEntryFields(win);
+            const nm = (state.customForgeNameDraft || '').trim();
+            const isPageMode = state.screen === 'entry_edit';
+            const sysText = (isPageMode ? s.forgePageSystemPrompt : s.forgeBookSystemPrompt || '').trim();
+            if (!nm) { window.alert('Введите название вашего пресета Кузницы.'); return; }
+            if (!sysText) { window.alert('Системный промпт не может быть пустым.'); return; }
+            if (!Array.isArray(s.customForgePresets)) s.customForgePresets = [];
+            const newId = 'user_fg_' + Date.now();
+            s.customForgePresets.push({
+                id: newId,
+                name: nm,
+                nameEn: nm,
+                placeholder: (state.customForgePhDraft || '').trim() || 'Опишите вашу задачу для Кузницы...',
+                bookPrompt: s.forgeBookSystemPrompt || FORGE_BOOK_PRESETS[0].bookPrompt,
+                pagePrompt: s.forgePageSystemPrompt || FORGE_BOOK_PRESETS[0].pagePrompt,
+            });
+            s.forgePresetId = newId;
+            state.showCustomForgePresetBox = false;
+            state.customForgeNameDraft = '';
+            state.customForgePhDraft = '';
+            stApi.saveSettings();
+            try { window.toastr?.success?.(`Пресет Кузницы «${nm}» сохранён!`); } catch {}
+            requestRender({ preserveBodyScroll: true });
+        });
+        win.querySelector('#pcx-fg-update-custom-preset')?.addEventListener('click', () => {
+            captureEntryFields(win);
+            if (!Array.isArray(s.customForgePresets)) return;
+            const target = s.customForgePresets.find(p => p.id === s.forgePresetId);
+            if (!target) return;
+            target.bookPrompt = s.forgeBookSystemPrompt;
+            target.pagePrompt = s.forgePageSystemPrompt;
+            stApi.saveSettings();
+            try { window.toastr?.success?.(`Пресет «${target.name}» обновлён!`); } catch {}
+        });
+        win.querySelector('#pcx-fg-del-custom-preset')?.addEventListener('click', () => {
+            if (!Array.isArray(s.customForgePresets)) return;
+            const target = s.customForgePresets.find(p => p.id === s.forgePresetId);
+            if (!target) return;
+            if (!window.confirm(`Удалить ваш пресет Кузницы «${target.name}»?`)) return;
+            s.customForgePresets = s.customForgePresets.filter(p => p.id !== target.id);
+            s.forgePresetId = FORGE_BOOK_PRESETS[0].id;
+            s.forgeBookSystemPrompt = FORGE_BOOK_PRESETS[0].bookPrompt;
+            s.forgePageSystemPrompt = FORGE_BOOK_PRESETS[0].pagePrompt;
+            stApi.saveSettings();
             requestRender({ preserveBodyScroll: true });
         });
         win.querySelector('#pcx-fg-reset-book-prompt')?.addEventListener('click', () => {
@@ -2635,6 +3061,25 @@ export function createForgeController(deps) {
         win.querySelector('#pcx-fg-wiz-profile')?.addEventListener('change', e => { s.aiProfileId = e.target.value; stApi.saveSettings(); });
         win.querySelector('#pcx-fg-wiz-lang')?.addEventListener('change', e => { s.aiLang = e.target.value; stApi.saveSettings(); });
         win.querySelectorAll('.pcx-fg-cat-chk').forEach(chk => chk.addEventListener('change', () => { state.wizSelectedCats[chk.dataset.catid] = chk.checked; }));
+        win.querySelectorAll('[data-wz-cat]').forEach(btn => btn.addEventListener('click', () => {
+            const cid = btn.dataset.wzCat;
+            if (!cid) return;
+            state.wizSelectedCats[cid] = !state.wizSelectedCats[cid];
+            requestRender({ preserveBodyScroll: true });
+        }));
+        win.querySelector('#pcx-fgc-to-manual')?.addEventListener('click', () => {
+            captureEntryFields(win);
+            const c = state.pageAiCandidates[state.pageAiCandIdx];
+            if (c && state.entryDraft) {
+                state.entryDraft.comment = c.comment || state.entryDraft.comment;
+                state.entryKeysRawText = c.keys || '';
+                state.entryKeysDirty = true;
+                state.entryDraft.key = parseSmartTriggerKeys(c.keys || '');
+                state.entryDraft.content = formatCleanParagraphs(c.content || '');
+                state.entryEditTab = 'manual';
+                requestRender({ preserveBodyScroll: true });
+            }
+        });
         win.querySelector('#pcx-fg-mute-cats')?.addEventListener('change', e => { state.wizMuteExportedCats = e.target.checked; });
         win.querySelector('#pcx-fg-src-char')?.addEventListener('change', e => { state.wizUseChar = e.target.checked; });
         win.querySelector('#pcx-fg-src-scen')?.addEventListener('change', e => { state.wizUseScenario = e.target.checked; });
@@ -2678,10 +3123,149 @@ export function createForgeController(deps) {
             win.querySelectorAll('.pcx-st-content').forEach(el => el.addEventListener('input', () => { state.stagedEntries[Number(el.dataset.idx)].content = el.value; }));
             win.querySelector('#pcx-fg-commit-btn')?.addEventListener('click', () => commitApprovedLorebook());
         }
+        // Live Drag-and-Drop reordering for Lorebook pages (updates displayIndex & prompt insertion order!)
+        if (state.screen === 'book_entries' && state.activeBookId && state.activeBookData) {
+            const bodyEl = win.querySelector('.pcx-main');
+            const targetBookId = state.activeBookId;
+            if (bodyEl) {
+                const startEntryDrag = (card, startY, isTouch) => {
+                    const rect = card.getBoundingClientRect();
+                    const offsetY = startY - rect.top;
+                    const placeholder = document.createElement('div');
+                    placeholder.className = 'pcx-drag-placeholder';
+                    placeholder.style.height = `${rect.height}px`;
+                    card.parentNode.insertBefore(placeholder, card);
+                    card.classList.add('pcx-card-floating');
+                    card.style.width = `${rect.width}px`;
+                    card.style.left = `${rect.left}px`;
+                    card.style.top = `${rect.top}px`;
+                    document.body.classList.add('pcx-dragging-active');
+                    if (isTouch) navigator.vibrate?.(15);
+
+                    let curY = startY, rafId = null;
+                    const updatePos = () => {
+                        rafId = null;
+                        card.style.top = `${curY - offsetY}px`;
+                        const bodyRect = bodyEl.getBoundingClientRect();
+                        if (curY < bodyRect.top + 48) bodyEl.scrollTop -= 9;
+                        else if (curY > bodyRect.bottom - 48) bodyEl.scrollTop += 9;
+                        const siblings = [...bodyEl.querySelectorAll('[data-fg-entry-uid]:not(.pcx-card-floating)')];
+                        let beforeEl = null;
+                        for (const sib of siblings) {
+                            const r = sib.getBoundingClientRect();
+                            if (curY < r.top + r.height / 2) { beforeEl = sib; break; }
+                        }
+                        if (beforeEl) bodyEl.insertBefore(placeholder, beforeEl);
+                        else bodyEl.appendChild(placeholder);
+                    };
+                    const onMove = ev => {
+                        if (isTouch) {
+                            if (!ev.touches[0]) return;
+                            if (ev.cancelable) ev.preventDefault();
+                            curY = ev.touches[0].clientY;
+                        } else curY = ev.clientY;
+                        if (!rafId) rafId = requestAnimationFrame(updatePos);
+                    };
+                    const onEnd = async () => {
+                        if (rafId) cancelAnimationFrame(rafId);
+                        document.body.classList.remove('pcx-dragging-active');
+                        if (isTouch) {
+                            window.removeEventListener('touchmove', onMove);
+                            window.removeEventListener('touchend', onEnd);
+                            window.removeEventListener('touchcancel', onEnd);
+                        } else {
+                            window.removeEventListener('mousemove', onMove);
+                            window.removeEventListener('mouseup', onEnd);
+                        }
+                        card.classList.remove('pcx-card-floating');
+                        card.style.width = ''; card.style.left = ''; card.style.top = ''; card.style.transform = '';
+                        placeholder.parentNode?.insertBefore(card, placeholder);
+                        placeholder.remove();
+                        if (!bodyEl.isConnected) return;
+                        const orderedUids = [...bodyEl.querySelectorAll('[data-fg-entry-uid]')].map(el => el.dataset.fgEntryUid).filter(Boolean);
+                        if (orderedUids.length < 2) return;
+                        try {
+                            await mutateBookAtomically(targetBookId, (fresh) => {
+                                const allSorted = Object.values(fresh.entries || {}).sort((a, b) => {
+                                    const da = Number.isFinite(Number(a?.displayIndex)) ? Number(a.displayIndex) : 999999;
+                                    const db = Number.isFinite(Number(b?.displayIndex)) ? Number(b.displayIndex) : 999999;
+                                    return da !== db ? da - db : Number(a?.uid) - Number(b?.uid);
+                                });
+                                const draggedSet = new Set(orderedUids);
+                                let qIdx = 0;
+                                const finalOrder = allSorted.map(ent => {
+                                    const uStr = String(ent.uid);
+                                    if (!draggedSet.has(uStr)) return ent;
+                                    const nextUid = orderedUids[qIdx++];
+                                    return fresh.entries[nextUid] || ent;
+                                });
+                                finalOrder.forEach((ent, idx) => {
+                                    if (!ent) return;
+                                    ent.displayIndex = idx;
+                                    ent.order = Math.max(1, 500 - idx);
+                                });
+                            });
+                            requestRender({ preserveBodyScroll: true });
+                        } catch (err) {
+                            console.warn('[PocketCodex] Page reorder failed:', err);
+                        }
+                    };
+                    if (isTouch) {
+                        window.addEventListener('touchmove', onMove, { passive: false });
+                        window.addEventListener('touchend', onEnd);
+                        window.addEventListener('touchcancel', onEnd);
+                    } else {
+                        window.addEventListener('mousemove', onMove);
+                        window.addEventListener('mouseup', onEnd);
+                    }
+                };
+
+                bodyEl.querySelectorAll('.pcx-fg-entry-grip').forEach(grip => {
+                    grip.addEventListener('contextmenu', e => e.preventDefault());
+                    grip.addEventListener('touchstart', e => {
+                        if (e.touches.length !== 1) return;
+                        e.preventDefault(); e.stopPropagation();
+                        const card = grip.closest('[data-fg-entry-uid]');
+                        if (card) startEntryDrag(card, e.touches[0].clientY, true);
+                    }, { passive: false });
+                    grip.addEventListener('mousedown', e => {
+                        if (e.button !== 0) return;
+                        e.preventDefault(); e.stopPropagation();
+                        const card = grip.closest('[data-fg-entry-uid]');
+                        if (card) startEntryDrag(card, e.clientY, false);
+                    });
+                });
+            }
+        }
     }
 
     return {
-        onEnterForge() { fetchBooksList().then(() => requestRender()); },
+        onEnterForge() { state.screen = 'shelf'; fetchBooksList().then(() => requestRender({ preserveBodyScroll: true })); },
+        ensureBooksLoadedQuietly() { if (!state.books.length && !state.loading) fetchBooksList().catch(() => {}); },
+        getShelfSnapshot() {
+            return state.books.map(b => ({
+                id: b.file_id,
+                name: b.name || b.file_id,
+                cover: sanitizeCoverDataUrl(b.extensions?.pocket_codex_cover),
+                count: state.bookCounts[b.file_id],
+            }));
+        },
+        async openBookFromHome(bookId, { openRecursion = false } = {}) {
+            if (!bookId) {
+                state.screen = 'shelf';
+                await fetchBooksList();
+                requestRender();
+                return;
+            }
+            const loaded = await openBookAtomic(bookId);
+            if (!loaded) return;
+            state.showRecursionPanel = Boolean(openRecursion);
+            state.entryQuery = '';
+            state.entryFilter = 'all';
+            state.screen = 'book_entries';
+            requestRender();
+        },
+        onEnterForgeHub() { state.screen = 'create_hub'; fetchBooksList().then(() => requestRender()); },
         onExternalWorldInfoUpdated(bookName, bookData) {
             if (!bookName || stApi.isOwnWorldInfoSave?.(bookData)) return false;
             let changed = false;

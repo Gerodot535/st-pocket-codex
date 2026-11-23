@@ -723,8 +723,9 @@ export function buildEntryCountPhrase(cnt, uiLang = 'ru') {
 export const UI_DICT = {
     en: {
         guideBtn: 'Guide',
-        wingCodex: "Author's Codex",
-        wingForge: 'Lorebook Forge',
+        wingHome: 'Home',
+        wingCodex: 'Notebook',
+        wingForge: 'Forge',
         thisChat: 'This Chat',
         noChat: 'No Chat Open',
         globalScope: 'Global',
@@ -737,8 +738,9 @@ export const UI_DICT = {
     },
     ru: {
         guideBtn: 'Гайд',
-        wingCodex: 'Кодекс Автора',
-        wingForge: 'Кузница Лорбуков',
+        wingHome: 'Главная',
+        wingCodex: 'Тетрадь',
+        wingForge: 'Кузница',
         thisChat: 'Этот чат',
         noChat: 'Чат не открыт',
         globalScope: 'Общие',
