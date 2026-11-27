@@ -139,7 +139,9 @@ export function unwrapAndParseModelJson(raw, expectedKind = 'any') {
 
     let txt = typeof cur === 'string' ? cur : String(cur?.text || cur?.content || '');
     txt = txt
-        .replace(/<think>[\s\S]*?<\/think>/gi, '')
+        .replace(/<(?:think|thought|thinking|thoughts|reasoning|cot|thought_process|inner_monologue|inner_thoughts|analysis|rp_plan)\b[^>]*>[\s\S]*?<\/(?:think|thought|thinking|thoughts|reasoning|cot|thought_process|inner_monologue|inner_thoughts|analysis|rp_plan)>/gi, '')
+        .replace(/```(?:think|thought|thinking|reasoning|cot)\b[\s\S]*?```/gi, '')
+        .replace(/^[\s\S]*?<\/(?:think|thought|thinking|thoughts|reasoning|cot|thought_process|inner_monologue|inner_thoughts|analysis|rp_plan)>\s*/i, '')
         .replace(/^```(?:json)?\s*/i, '')
         .replace(/\s*```$/i, '')
         .trim();

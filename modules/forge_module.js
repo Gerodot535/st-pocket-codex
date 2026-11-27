@@ -1,5 +1,5 @@
-import { ICONS, LANGUAGES, renderProceduralCoverSvg } from './themes_and_icons.js';
-import { executePcxAiRequest, toBlobDisplayUrl, readImageFileLossless } from './ai_engine.js';
+import { ICONS, LANGUAGES, renderProceduralCoverSvg } from './themes_and_icons.js?v=1.1.6';
+import { executePcxAiRequest, toBlobDisplayUrl, readImageFileLossless } from './ai_engine.js?v=1.1.6';
 import {
     FORGE_BOOK_PRESETS,
     formatCleanParagraphs,
@@ -12,7 +12,7 @@ import {
     checkEntrySecondaryKeysInText,
     tUi,
     displayCategoryName,
-} from './presets_and_i18n.js';
+} from './presets_and_i18n.js?v=1.1.6';
 
 const FORGE_JSON_SCHEMA = {
     name: 'lorebook_forge_entries',
@@ -224,6 +224,8 @@ export function createForgeController(deps) {
         stApi, escapeHtml, renderHelpBtn, renderHelpBubble,
         compressImageFile, readTextAttachment, getActiveStore,
         ensureSettings, getConnectionProfiles, getCharacterDescriptionText,
+        getEffectiveScenarioText, getCharacterSourcePickerState,
+        setCharacterSourceSelection, bindLorebookToTargetChar,
         getUserPersonaDescriptionText, buildChatContextSnippet, buildWordLimitPhrase,
         saveAllCodex, requestRender,
     } = deps;
@@ -241,6 +243,12 @@ export function createForgeController(deps) {
         newBookName: '',
         newBookCover: '',
         newBookBindScope: 'none',
+
+        bindDrawerMode: '',      // '' | 'char' | 'chat'
+        bindCharQuery: '',
+        bindChatCharAvatar: '',
+        bindChatList: [],
+        bindChatLoading: false,
 
         shelfQuery: '',
         shelfFilter: 'all',
@@ -695,14 +703,53 @@ export function createForgeController(deps) {
         return /^\[?\s*memory\s*#?\d+/i.test(String(ent.comment || ''));
     }
 
+    async function loadSavedChatsForBindPicker(avatarFileName) {
+        state.bindChatCharAvatar = String(avatarFileName || '');
+        state.bindChatList = [];
+        if (!state.bindChatCharAvatar || typeof stApi.listCharacterChatsWithLore !== 'function') {
+            requestRender({ preserveBodyScroll: true });
+            return;
+        }
+        state.bindChatLoading = true;
+        requestRender({ preserveBodyScroll: true });
+        try {
+            state.bindChatList = await stApi.listCharacterChatsWithLore(state.bindChatCharAvatar);
+        } finally {
+            state.bindChatLoading = false;
+            requestRender({ preserveBodyScroll: true });
+        }
+    }
+
+    function buildHumanBindSummary(fileId, uiLang = 'ru') {
+        const globals = stApi.getGlobalLorebooks?.() || [];
+        const isGlob = globals.includes(fileId);
+        const isChat = getChatBoundBooks().includes(fileId);
+        const boundChars = stApi.getCharactersBoundToBook?.(fileId) || [];
+        const parts = [];
+        if (isGlob) parts.push(tUi(uiLang, 'Везде (во всех чатах)', 'Everywhere (Global)'));
+        if (boundChars.length === 1) {
+            parts.push(`${tUi(uiLang, 'Персонаж', 'Character')} «${boundChars[0].name}»`);
+        } else if (boundChars.length > 1) {
+            parts.push(`${tUi(uiLang, 'Персонажи:', 'Characters:')} ${boundChars.slice(0, 2).map(c => `«${c.name}»`).join(', ')}${boundChars.length > 2 ? ` +${boundChars.length - 2}` : ''}`);
+        }
+        if (isChat && stApi.isChatOpen()) {
+            const chatNm = stApi.getActiveChatDisplayName?.(uiLang) || '';
+            parts.push(chatNm ? `${tUi(uiLang, 'Текущий чат с', 'Current chat with')} «${chatNm}»` : tUi(uiLang, 'Текущий чат', 'Current chat'));
+        }
+        if (!parts.length) {
+            return tUi(uiLang, 'Книга пока лежит на полке и никуда не подключена.', 'This Lorebook is resting on the shelf and not bound anywhere yet.');
+        }
+        return `${tUi(uiLang, 'Подключена:', 'Active in:')} ${parts.join(' · ')}`;
+    }
+
     function renderBindPills(fileId, { inlineMode = false } = {}) {
         const uiLang = ensureSettings().uiLang || 'ru';
         const globals = stApi.getGlobalLorebooks?.() || [];
         const isGlob = globals.includes(fileId);
         const isChat = getChatBoundBooks().includes(fileId);
-        const isChar = stApi.getCharLorebook?.() === fileId;
+        const boundChars = stApi.getCharactersBoundToBook?.(fileId) || [];
+        const isAnyCharBound = boundChars.length > 0 || (stApi.getCharLorebook?.() === fileId);
         const chatOpen = stApi.isChatOpen();
-        const charOpen = isSingleCharOpen();
         const mb = stApi.getMemoryBooksStatus?.() || { installed: false, enabled: false, targetBook: '', mode: 'chat' };
         const isMbTarget = Boolean(mb.installed && mb.enabled && mb.targetBook && mb.targetBook === fileId);
         const mbTitle = mb.mode === 'lock'
@@ -710,22 +757,109 @@ export function createForgeController(deps) {
             : tUi(uiLang, 'Назначить этот Лорбук приёмником воспоминаний Memory Books в текущем чате', 'Route Memory Books memories into this Lorebook for the active chat');
 
         if (inlineMode) {
+            const charBtnLabel = boundChars.length === 1
+                ? `${tUi(uiLang, 'Персонаж', 'Char')} · ${boundChars[0].name.slice(0, 18)}`
+                : (boundChars.length > 1
+                    ? `${tUi(uiLang, 'Персонажи', 'Chars')} · ${boundChars.length}`
+                    : tUi(uiLang, 'Персонаж', 'Character'));
+            const activeChatShort = (isChat && chatOpen)
+                ? (stApi.getActiveChatDisplayName?.(uiLang) || '').slice(0, 16)
+                : '';
+            const chatBtnLabel = activeChatShort
+                ? `${tUi(uiLang, 'Чат', 'Chat')} · ${activeChatShort}`
+                : tUi(uiLang, 'Чат', 'Chat');
+
+            const allChars = Array.isArray(stApi.ctx?.characters) ? stApi.ctx.characters.filter(c => c?.avatar) : [];
+            const cq = state.bindCharQuery.trim().toLowerCase();
+            const filteredChars = cq
+                ? allChars.filter(c => String(c.name || c.avatar).toLowerCase().includes(cq))
+                : allChars;
+            const boundByAv = new Map(boundChars.map(b => [b.avatar, b.mode]));
+
+            let drawerHtml = '';
+            if (state.bindDrawerMode === 'char') {
+                drawerHtml = `
+                    <div class="pcx-stack" style="margin-top:10px;padding-top:10px;border-top:1px solid var(--line);">
+                        <div class="pcx-actions pcx-between">
+                            <small>${tUi(uiLang, 'Отметьте персонажей, для которых работает эта книга (заходить в чат не нужно):', 'Tap characters to attach or detach this Lorebook (no need to enter chat):')}</small>
+                            <button type="button" class="pcx-btn pcx-btn-xs pcx-btn-secondary" data-fg-close-drawer="1">${tUi(uiLang, 'Скрыть', 'Close')}</button>
+                        </div>
+                        ${allChars.length > 6 ? `<input type="search" id="pcx-fg-bind-char-q" class="pcx-input" placeholder="${tUi(uiLang, 'Быстрый фильтр по имени...', 'Filter by character name...')}" value="${escapeHtml(state.bindCharQuery)}">` : ''}
+                        <div class="pcx-stack" style="max-height:210px;overflow-y:auto;gap:5px;">
+                            ${filteredChars.length === 0
+                                ? `<small>${tUi(uiLang, 'Персонажи не найдены.', 'No characters found.')}</small>`
+                                : filteredChars.map(ch => {
+                                    const bMode = boundByAv.get(ch.avatar);
+                                    const on = Boolean(bMode);
+                                    const badge = bMode === 'extra'
+                                        ? tUi(uiLang, 'Доп. книга', 'Extra')
+                                        : (bMode === 'primary' ? tUi(uiLang, 'Подключена', 'Bound') : tUi(uiLang, 'Подключить', 'Attach'));
+                                    return `<button type="button" class="pcx-actions pcx-between pcx-surface" data-fg-bind-char="${escapeHtml(ch.avatar)}" data-fg-book="${escapeHtml(fileId)}" style="width:100%;padding:7px 10px;text-align:left;cursor:pointer;border-color:${on ? 'var(--accent)' : 'var(--line)'};background:${on ? 'var(--accent-wash)' : 'var(--paper)'};">
+                                        <span style="font-weight:${on ? '600' : '400'};overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(ch.name || ch.avatar)}</span>
+                                        <span class="pcx-key-badge" style="${on ? 'border-color:var(--accent);color:var(--accent);' : ''}">${escapeHtml(badge)}</span>
+                                    </button>`;
+                                }).join('')}
+                        </div>
+                    </div>`;
+            } else if (state.bindDrawerMode === 'chat') {
+                const openChatTitle = chatOpen ? (stApi.getActiveChatDisplayName?.(uiLang) || tUi(uiLang, 'Текущий чат', 'Current chat')) : '';
+                drawerHtml = `
+                    <div class="pcx-stack" style="margin-top:10px;padding-top:10px;border-top:1px solid var(--line);">
+                        <div class="pcx-actions pcx-between">
+                            <small>${tUi(uiLang, 'Выберите чат, в котором должна работать только эта книга:', 'Choose a specific chat where this Lorebook should be active:')}</small>
+                            <button type="button" class="pcx-btn pcx-btn-xs pcx-btn-secondary" data-fg-close-drawer="1">${tUi(uiLang, 'Скрыть', 'Close')}</button>
+                        </div>
+                        ${chatOpen ? `
+                            <button type="button" class="pcx-actions pcx-between pcx-surface" data-fg-bind-curchat="1" data-fg-book="${escapeHtml(fileId)}" style="width:100%;padding:8px 10px;text-align:left;cursor:pointer;border-color:${isChat ? 'var(--accent)' : 'var(--line)'};background:${isChat ? 'var(--accent-wash)' : 'var(--paper)'};">
+                                <span><strong>${tUi(uiLang, 'Открытый сейчас чат:', 'Currently open chat:')}</strong> «${escapeHtml(openChatTitle)}»</span>
+                                <span class="pcx-key-badge" style="${isChat ? 'border-color:var(--accent);color:var(--accent);' : ''}">${isChat ? tUi(uiLang, 'Подключена', 'Bound') : tUi(uiLang, 'Подключить', 'Attach')}</span>
+                            </button>` : ''}
+                        ${allChars.length > 0 ? `
+                            <label class="pcx-field">
+                                <span>${tUi(uiLang, 'Сохранённые чаты персонажа', 'Character Saved Chats')}</span>
+                                <select id="pcx-fg-bind-chat-char" class="pcx-input">
+                                    <option value="">${tUi(uiLang, '— Выберите персонажа —', '— Select character —')}</option>
+                                    ${allChars.map(ch => `<option value="${escapeHtml(ch.avatar)}" ${state.bindChatCharAvatar === ch.avatar ? 'selected' : ''}>${escapeHtml(ch.name || ch.avatar)}</option>`).join('')}
+                                </select>
+                            </label>` : ''}
+                        ${state.bindChatLoading ? `<small>${ICONS.spinner} ${tUi(uiLang, 'Читаем список чатов...', 'Loading chats...')}</small>` : ''}
+                        ${(!state.bindChatLoading && state.bindChatCharAvatar) ? `
+                            <div class="pcx-stack" style="max-height:190px;overflow-y:auto;gap:5px;">
+                                ${state.bindChatList.length === 0
+                                    ? `<small>${tUi(uiLang, 'У этого персонажа пока нет сохранённых чатов.', 'No saved chats for this character yet.')}</small>`
+                                    : state.bindChatList.map(ct => {
+                                        const cOn = Array.isArray(ct.books) && ct.books.includes(fileId);
+                                        return `<button type="button" class="pcx-actions pcx-between pcx-surface" data-fg-bind-savedchat="${escapeHtml(ct.fileId)}" data-fg-book="${escapeHtml(fileId)}" style="width:100%;padding:7px 10px;text-align:left;cursor:pointer;border-color:${cOn ? 'var(--accent)' : 'var(--line)'};background:${cOn ? 'var(--accent-wash)' : 'var(--paper)'};">
+                                            <div style="min-width:0;flex:1;">
+                                                <div style="font-weight:${cOn ? '600' : '400'};overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(ct.label)}</div>
+                                                ${ct.lastMes ? `<small style="display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:0.75;">${escapeHtml(ct.lastMes)}</small>` : ''}
+                                            </div>
+                                            <span class="pcx-key-badge" style="${cOn ? 'border-color:var(--accent);color:var(--accent);' : ''}">${cOn ? tUi(uiLang, 'Подключена', 'Bound') : tUi(uiLang, 'Подключить', 'Attach')}</span>
+                                        </button>`;
+                                    }).join('')}
+                            </div>` : ''}
+                    </div>`;
+            }
+
             return `
-                <div class="pcx-actions">
-                    <button type="button" class="pcx-chip ${isChat ? 'pcx-active' : ''}" data-fg-scope="chat" data-fg-book="${escapeHtml(fileId)}" ${!chatOpen ? 'disabled' : ''}>${tUi(uiLang, 'Чат', 'Chat')}</button>
-                    <button type="button" class="pcx-chip ${isGlob ? 'pcx-active' : ''}" data-fg-scope="global" data-fg-book="${escapeHtml(fileId)}">${tUi(uiLang, 'Глобально', 'Global')}</button>
-                    <button type="button" class="pcx-chip ${isChar ? 'pcx-active' : ''}" data-fg-scope="char" data-fg-book="${escapeHtml(fileId)}" ${!charOpen ? 'disabled' : ''}>${tUi(uiLang, 'Персонаж', 'Char')}</button>
-                    ${mb.installed ? `<button type="button" class="pcx-chip ${isMbTarget ? 'pcx-active' : ''}" data-fg-scope="memory" data-fg-book="${escapeHtml(fileId)}" ${(!chatOpen || !mb.enabled) ? 'disabled' : ''} title="${escapeHtml(mbTitle)}">${ICONS.memory}<span>Memory Books</span></button>` : ''}
+                <div style="width:100%;">
+                    <div class="pcx-actions" style="flex-wrap:wrap;">
+                        <button type="button" class="pcx-chip ${isGlob ? 'pcx-active' : ''}" data-fg-scope="global" data-fg-book="${escapeHtml(fileId)}" title="${tUi(uiLang, 'Работает сразу во всех чатах Таверны', 'Active across all chats in SillyTavern')}">${tUi(uiLang, 'Везде', 'Everywhere')}</button>
+                        <button type="button" class="pcx-chip ${(isAnyCharBound || state.bindDrawerMode === 'char') ? 'pcx-active' : ''}" data-fg-scope="char_drawer" data-fg-book="${escapeHtml(fileId)}">${escapeHtml(charBtnLabel)} ${ICONS.chevDown}</button>
+                        <button type="button" class="pcx-chip ${(isChat || state.bindDrawerMode === 'chat') ? 'pcx-active' : ''}" data-fg-scope="chat_drawer" data-fg-book="${escapeHtml(fileId)}">${escapeHtml(chatBtnLabel)} ${ICONS.chevDown}</button>
+                        ${(mb.installed && mb.enabled && chatOpen) ? `<button type="button" class="pcx-chip ${isMbTarget ? 'pcx-active' : ''}" data-fg-scope="memory" data-fg-book="${escapeHtml(fileId)}" title="${escapeHtml(mbTitle)}">${ICONS.memory}<span>Memory Books</span></button>` : ''}
+                    </div>
+                    ${drawerHtml}
                 </div>`;
         }
 
         return `
-            <div class="pcx-bind-strip" title="${tUi(uiLang, 'Независимые области привязки книги', 'Independent Lorebook binding scopes')}">
-                <button type="button" class="pcx-bind-pill ${isChat ? 'pcx-on' : ''}" data-fg-scope="chat" data-fg-book="${escapeHtml(fileId)}" ${!chatOpen ? 'disabled' : ''} title="${tUi(uiLang, 'Привязать к текущему чату (поддерживается несколько книг)', 'Bind to current chat')}">${tUi(uiLang, 'Чат', 'Chat')}</button>
-                <button type="button" class="pcx-bind-pill ${isGlob ? 'pcx-on' : ''}" data-fg-scope="global" data-fg-book="${escapeHtml(fileId)}" title="${tUi(uiLang, 'Включить глобально в меню Мира Таверны', 'Toggle Global Lorebook')}">${tUi(uiLang, 'Глоб.', 'Global')}</button>
-                <button type="button" class="pcx-bind-pill ${isChar ? 'pcx-on' : ''}" data-fg-scope="char" data-fg-book="${escapeHtml(fileId)}" ${!charOpen ? 'disabled' : ''} title="${tUi(uiLang, 'Привязать как основной Лорбук персонажа', 'Bind to character card')}">${tUi(uiLang, 'Чар', 'Char')}</button>
+            <div class="pcx-bind-strip" title="${tUi(uiLang, 'Где работает эта книга', 'Where this Lorebook is active')}">
+                <button type="button" class="pcx-bind-pill ${isGlob ? 'pcx-on' : ''}" data-fg-scope="global" data-fg-book="${escapeHtml(fileId)}" title="${tUi(uiLang, 'Включить во всех чатах Таверны', 'Toggle Everywhere (Global)')}">${tUi(uiLang, 'Везде', 'Global')}</button>
+                <button type="button" class="pcx-bind-pill ${isAnyCharBound ? 'pcx-on' : ''}" data-fg-scope="shelf_char" data-fg-book="${escapeHtml(fileId)}" title="${tUi(uiLang, 'Выбрать персонажей для этой книги', 'Choose characters for this book')}">${tUi(uiLang, 'Чар', 'Char')}${boundChars.length > 1 ? `·${boundChars.length}` : ''}</button>
+                <button type="button" class="pcx-bind-pill ${isChat ? 'pcx-on' : ''}" data-fg-scope="shelf_chat" data-fg-book="${escapeHtml(fileId)}" title="${tUi(uiLang, 'Подключить к чату', 'Attach to chat')}">${tUi(uiLang, 'Чат', 'Chat')}</button>
             </div>
-            ${mb.installed ? `<div class="pcx-mb-pill-row"><button type="button" class="pcx-bind-pill ${isMbTarget ? 'pcx-on' : ''}" data-fg-scope="memory" data-fg-book="${escapeHtml(fileId)}" ${(!chatOpen || !mb.enabled) ? 'disabled' : ''} title="${escapeHtml(mbTitle)}">${ICONS.memory}<span>${isMbTarget ? tUi(uiLang, 'Приёмник Memory Books', 'Memory Books Target') : 'Memory Books'}</span></button></div>` : ''}`;
+            ${(mb.installed && mb.enabled && chatOpen) ? `<div class="pcx-mb-pill-row"><button type="button" class="pcx-bind-pill ${isMbTarget ? 'pcx-on' : ''}" data-fg-scope="memory" data-fg-book="${escapeHtml(fileId)}" title="${escapeHtml(mbTitle)}">${ICONS.memory}<span>${isMbTarget ? tUi(uiLang, 'Приёмник Memory Books', 'Memory Books Target') : 'Memory Books'}</span></button></div>` : ''}`;
     }
 
     function isSingleCharOpen() {
@@ -1327,26 +1461,31 @@ export function createForgeController(deps) {
                 if (cd) sourceBlocks.push(cd);
             }
             if (state.wizUseScenario) {
-                const ctx = stApi.ctx;
-                const chars = Array.isArray(ctx.characters) ? ctx.characters : [];
-                const scenParts = [];
-                if (ctx.groupId && Array.isArray(ctx.groups)) {
-                    const grp = ctx.groups.find(g => String(g.id) === String(ctx.groupId));
-                    if (grp && Array.isArray(grp.members)) {
-                        for (const av of grp.members.slice(0, 5)) {
-                            const mCh = chars.find(c => c.avatar === av);
-                            const mScen = (mCh?.scenario || mCh?.data?.scenario || '').trim();
-                            if (mScen) scenParts.push(`${mCh.name || 'Персонаж'}: ${mScen}`);
-                        }
-                    }
+                const effScen = typeof getEffectiveScenarioText === 'function' ? getEffectiveScenarioText() : '';
+                if (effScen) {
+                    sourceBlocks.push(effScen);
                 } else {
-                    const ch = (ctx.characterId !== undefined && ctx.characterId !== null) ? chars[ctx.characterId] : null;
-                    const scen = (ch?.scenario || ch?.data?.scenario || '').trim();
-                    const firstMes = (ch?.first_mes || '').trim();
-                    if (scen) scenParts.push(scen);
-                    if (firstMes) scenParts.push(firstMes);
+                    const ctx = stApi.ctx;
+                    const chars = Array.isArray(ctx.characters) ? ctx.characters : [];
+                    const scenParts = [];
+                    if (ctx.groupId && Array.isArray(ctx.groups)) {
+                        const grp = ctx.groups.find(g => String(g.id) === String(ctx.groupId));
+                        if (grp && Array.isArray(grp.members)) {
+                            for (const av of grp.members.slice(0, 5)) {
+                                const mCh = chars.find(c => c.avatar === av);
+                                const mScen = (mCh?.scenario || mCh?.data?.scenario || '').trim();
+                                if (mScen) scenParts.push(`${mCh.name || 'Персонаж'}: ${mScen}`);
+                            }
+                        }
+                    } else {
+                        const ch = (ctx.characterId !== undefined && ctx.characterId !== null) ? chars[ctx.characterId] : null;
+                        const scen = (ch?.scenario || ch?.data?.scenario || '').trim();
+                        const firstMes = (ch?.first_mes || '').trim();
+                        if (scen) scenParts.push(scen);
+                        if (firstMes) scenParts.push(firstMes);
+                    }
+                    if (scenParts.length) sourceBlocks.push(`[Сценарий и завязка]\n${scenParts.join('\n\n')}`);
                 }
-                if (scenParts.length) sourceBlocks.push(`[Сценарий и завязка]\n${scenParts.join('\n\n')}`);
             }
             if (state.wizUsePersona) { const pd = getUserPersonaDescriptionText(); if (pd) sourceBlocks.push(pd); }
             if (state.wizUseChat) { const ct = buildChatContextSnippet(state.wizChatCount); if (ct) sourceBlocks.push(ct); }
@@ -1605,7 +1744,9 @@ export function createForgeController(deps) {
 
             let postSaveNotice = '';
             const contextStillMatches = isSameContextAnchor(session.anchor);
-            if (contextStillMatches) {
+            if (session.bindScope === 'target_char' && typeof bindLorebookToTargetChar === 'function') {
+                await bindLorebookToTargetChar(fileId);
+            } else if (contextStillMatches) {
                 await applyBindingScope(fileId, session.bindScope, session.anchor);
                 if (session.muteCats && session.selectedCatIds.length > 0 && isSameContextAnchor(session.anchor)) {
                     const targetStore = session.anchor.storeRef || getActiveStore();
@@ -1633,6 +1774,9 @@ export function createForgeController(deps) {
             state.wizUploadedDocs = [];
             state.stagedEntries = [];
             await fetchBooksList();
+            try {
+                window.dispatchEvent(new CustomEvent('nmf:lorebook-forged', { detail: { bookId: fileId } }));
+            } catch {}
             state.activeBookId = fileId;
             state.activeBookData = savedData;
             state.saveError = postSaveNotice;
@@ -1759,6 +1903,9 @@ export function createForgeController(deps) {
         // 3. FULL LOREBOOK WIZARD (1:1 Concept renderForgeWizard + Custom Presets)
         if (state.screen === 'wizard') {
             const curBookPrompt = (s.forgeBookSystemPrompt && s.forgeBookSystemPrompt.trim()) ? s.forgeBookSystemPrompt : activePreset.bookPrompt;
+            const charPicker = typeof getCharacterSourcePickerState === 'function'
+                ? getCharacterSourcePickerState(uiLang)
+                : { selectedValue: '', hasExternalCard: false, canBindTargetChar: false, targetCharName: '', options: [] };
             return `
                 <button type="button" class="pcx-back-link" id="pcx-fg-open-hub-btn">${ICONS.chevLeft}<span>${tUi(uiLang, 'Назад в Кузницу', 'Back to Forge Hub')}</span></button>
                 <div class="pcx-surface pcx-panel pcx-stack">
@@ -1794,7 +1941,7 @@ export function createForgeController(deps) {
                             <select id="pcx-fg-bind-scope-after" class="pcx-input">
                                 ${stApi.isChatOpen() ? `<option value="chat" ${state.bindAfterScope === 'chat' ? 'selected' : ''}>${tUi(uiLang, 'Только в этот чат', 'This Chat Only')}</option>` : ''}
                                 <option value="global" ${state.bindAfterScope === 'global' ? 'selected' : ''}>${tUi(uiLang, 'Глобально (меню Мира Таверны)', 'Global (World Info menu)')}</option>
-                                ${isSingleCharOpen() ? `<option value="char" ${state.bindAfterScope === 'char' ? 'selected' : ''}>${tUi(uiLang, 'К карточке персонажа', 'Character Card')}</option>` : ''}
+                                ${charPicker.canBindTargetChar ? `<option value="target_char" ${state.bindAfterScope === 'target_char' ? 'selected' : ''}>${tUi(uiLang, `К карточке «${charPicker.targetCharName}» в СТ`, `To "${charPicker.targetCharName}" in ST`)}</option>` : (isSingleCharOpen() ? `<option value="char" ${state.bindAfterScope === 'char' ? 'selected' : ''}>${tUi(uiLang, 'К карточке персонажа', 'Character Card')}</option>` : '')}
                                 <option value="none" ${state.bindAfterScope === 'none' ? 'selected' : ''}>${tUi(uiLang, 'Не подключать сразу', 'Do Not Bind Immediately')}</option>
                             </select>
                         </label>
@@ -1890,6 +2037,13 @@ export function createForgeController(deps) {
 
                     <div class="pcx-surface pcx-panel pcx-stack" style="background:var(--paper);">
                         <strong>${tUi(uiLang, 'Источники контекста и перенос из Тетради', 'Context Sources & Notebook Transfer')}</strong>
+                        ${charPicker.options.length > 0 ? `
+                            <label class="pcx-field">
+                                <span>${tUi(uiLang, 'Карточка / определения персонажа для Кузницы', 'Character Card / Definitions Source')}</span>
+                                <select id="pcx-fg-char-source" class="pcx-input">
+                                    ${charPicker.options.map(opt => `<option value="${escapeHtml(opt.value)}" ${charPicker.selectedValue === opt.value ? 'selected' : ''}>${escapeHtml(opt.label)}</option>`).join('')}
+                                </select>
+                            </label>` : ''}
                         <div class="pcx-chk-row">
                             <label class="pcx-chk-label"><input type="checkbox" id="pcx-fg-src-char" ${state.wizUseChar ? 'checked' : ''}><span>${tUi(uiLang, 'Карточка персонажа', 'Character Card')}</span></label>
                             <label class="pcx-chk-label"><input type="checkbox" id="pcx-fg-src-scen" ${state.wizUseScenario ? 'checked' : ''}><span>${tUi(uiLang, 'Сценарий', 'Scenario')}</span></label>
@@ -2251,7 +2405,7 @@ export function createForgeController(deps) {
                 <div class="pcx-page-head">
                     <div>
                         <h1>${escapeHtml(state.activeBookId)}</h1>
-                        <p>${isAnyBound ? tUi(uiLang, 'Книга подключена и активна. Потяните за ручку слева от заголовка, чтобы менять порядок страниц и приоритет в промпте.', 'Lorebook is bound and active. Drag the grip handle on any page to adjust display & prompt insertion order.') : tUi(uiLang, 'Книга сейчас свободна на полке — включите Чат, Глобально или Персонаж ниже.', 'This Lorebook is currently unbound — toggle Chat, Global, or Char below.')}</p>
+                        <p>${escapeHtml(buildHumanBindSummary(state.activeBookId, uiLang))}</p>
                     </div>
                     <div class="pcx-actions">
                         <button type="button" class="pcx-btn pcx-btn-soft ${state.showRecursionPanel ? 'pcx-active' : ''}" id="pcx-fg-rec-btn">${ICONS.loop}<span>${tUi(uiLang, 'Инспектор рекурсии', 'Recursion Inspector')}${recReport.loops.length ? ` (${recReport.loops.length})` : ''}</span></button>
@@ -2261,8 +2415,8 @@ export function createForgeController(deps) {
                 </div>
 
                 <div class="pcx-sec-route-bar">
-                    <div class="pcx-sec-route-info">
-                        <strong>${tUi(uiLang, 'Привязка тома:', 'Tome Binding:')}</strong>
+                    <div class="pcx-sec-route-info" style="flex-direction:column;align-items:stretch;gap:8px;width:100%;">
+                        <strong>${tUi(uiLang, 'Где работает книга:', 'Where this book works:')}</strong>
                         ${renderBindPills(state.activeBookId, { inlineMode: true })}
                     </div>
                 </div>
@@ -2277,9 +2431,8 @@ export function createForgeController(deps) {
                 ${recursionPanelHtml}
 
                 ${totalEntries > 0 ? `
-                    <div class="pcx-search-bar">
+                    <div class="pcx-search-bar" style="grid-template-columns:1fr;">
                         <input type="search" id="pcx-fg-entry-search" class="pcx-input" placeholder="${tUi(uiLang, 'Поиск страницы по названию, ключам или тексту...', 'Search pages by title, keys, or lore...')}" value="${escapeHtml(state.entryQuery)}">
-                        <button type="button" class="pcx-btn pcx-btn-secondary" id="pcx-fg-collapse-all">${allCollapsed ? tUi(uiLang, 'Развернуть все', 'Expand All') : tUi(uiLang, 'Свернуть все', 'Collapse All')}</button>
                     </div>
                     <div class="pcx-carousel-row">
                         ${filterChips.map(([fid, lbl]) => `<button type="button" class="pcx-chip ${state.entryFilter === fid ? 'pcx-active' : ''}" data-fg-efilter="${fid}">${escapeHtml(lbl)}</button>`).join('')}
@@ -2338,6 +2491,7 @@ export function createForgeController(deps) {
                                                 <button type="button" class="pcx-btn pcx-btn-xs pcx-btn-danger-ghost" data-fg-del="${safeUid}">${tUi(uiLang, 'Удалить', 'Delete')}</button>
                                             </div>
                                         ` : ''}
+                                        <button type="button" class="pcx-entry-tongue" data-fg-collapse="${safeUid}" aria-expanded="${!isCol}" title="${isCol ? tUi(uiLang, 'Развернуть запись', 'Expand entry') : tUi(uiLang, 'Свернуть запись', 'Collapse entry')}">${isCol ? ICONS.chevDown : ICONS.chevUp}</button>
                                     </article>`;
                             }).join(''))}
                 </div>`;
@@ -2537,10 +2691,48 @@ export function createForgeController(deps) {
             e.stopPropagation();
             const scope = btn.dataset.fgScope, bookId = btn.dataset.fgBook;
             if (!bookId) return;
-            if (scope === 'global') await stApi.toggleGlobalLorebook?.(bookId);
-            else if (scope === 'chat') await toggleBindBookToChat(bookId);
-            else if (scope === 'char') await stApi.toggleCharLorebook?.(bookId);
-            else if (scope === 'memory') {
+            if (scope === 'global') {
+                await stApi.toggleGlobalLorebook?.(bookId);
+            } else if (scope === 'char_drawer') {
+                state.bindDrawerMode = state.bindDrawerMode === 'char' ? '' : 'char';
+            } else if (scope === 'chat_drawer') {
+                const opening = state.bindDrawerMode !== 'chat';
+                state.bindDrawerMode = opening ? 'chat' : '';
+                if (opening && !state.bindChatCharAvatar) {
+                    const c = stApi.ctx || {};
+                    const activeAv = (!c.groupId && c.characterId !== undefined && c.characterId !== null && Array.isArray(c.characters))
+                        ? (c.characters[c.characterId]?.avatar || '')
+                        : '';
+                    if (activeAv) {
+                        loadSavedChatsForBindPicker(activeAv);
+                        return;
+                    }
+                }
+            } else if (scope === 'shelf_char') {
+                const loaded = await openBookAtomic(bookId);
+                if (loaded) {
+                    state.bindDrawerMode = 'char';
+                    state.entryQuery = '';
+                    state.entryFilter = 'all';
+                    state.screen = 'book_entries';
+                }
+            } else if (scope === 'shelf_chat') {
+                if (stApi.isChatOpen()) {
+                    await toggleBindBookToChat(bookId);
+                } else {
+                    const loaded = await openBookAtomic(bookId);
+                    if (loaded) {
+                        state.bindDrawerMode = 'chat';
+                        state.entryQuery = '';
+                        state.entryFilter = 'all';
+                        state.screen = 'book_entries';
+                    }
+                }
+            } else if (scope === 'chat') {
+                await toggleBindBookToChat(bookId);
+            } else if (scope === 'char') {
+                await stApi.toggleCharLorebook?.(bookId);
+            } else if (scope === 'memory') {
                 const res = await stApi.assignMemoryBook?.(bookId);
                 if (res && !res.ok && res.reason === 'locked') {
                     const uiLang = s.uiLang || 'ru';
@@ -2554,6 +2746,40 @@ export function createForgeController(deps) {
                 }
             }
             requestRender({ preserveBodyScroll: true });
+        }));
+
+        win.querySelectorAll('[data-fg-close-drawer]').forEach(b => b.addEventListener('click', () => {
+            state.bindDrawerMode = '';
+            requestRender({ preserveBodyScroll: true });
+        }));
+        win.querySelector('#pcx-fg-bind-char-q')?.addEventListener('input', e => {
+            state.bindCharQuery = e.target.value;
+            requestRender({ preserveBodyScroll: true });
+        });
+        win.querySelectorAll('[data-fg-bind-char]').forEach(b => b.addEventListener('click', async () => {
+            const av = b.dataset.fgBindChar, bookId = b.dataset.fgBook;
+            if (!av || !bookId) return;
+            await stApi.toggleBookForCharacterAvatar?.(bookId, av);
+            requestRender({ preserveBodyScroll: true });
+        }));
+        win.querySelectorAll('[data-fg-bind-curchat]').forEach(b => b.addEventListener('click', async () => {
+            const bookId = b.dataset.fgBook;
+            if (!bookId) return;
+            await toggleBindBookToChat(bookId);
+            requestRender({ preserveBodyScroll: true });
+        }));
+        win.querySelector('#pcx-fg-bind-chat-char')?.addEventListener('change', e => {
+            loadSavedChatsForBindPicker(e.target.value);
+        });
+        win.querySelectorAll('[data-fg-bind-savedchat]').forEach(b => b.addEventListener('click', async () => {
+            const chatId = b.dataset.fgBindSavedchat, bookId = b.dataset.fgBook;
+            if (!chatId || !bookId || !state.bindChatCharAvatar) return;
+            try {
+                await stApi.toggleBookInSavedChat?.(bookId, state.bindChatCharAvatar, chatId);
+                await loadSavedChatsForBindPicker(state.bindChatCharAvatar);
+            } catch (err) {
+                window.alert('Не удалось изменить привязку чата: ' + (err?.message || String(err)));
+            }
         }));
 
         win.querySelector('#pcx-fg-newname')?.addEventListener('input', e => { state.newBookName = e.target.value; });
@@ -3113,6 +3339,16 @@ export function createForgeController(deps) {
             }
         });
         win.querySelector('#pcx-fg-mute-cats')?.addEventListener('change', e => { state.wizMuteExportedCats = e.target.checked; });
+        win.querySelector('#pcx-fg-char-source')?.addEventListener('change', e => {
+            if (typeof setCharacterSourceSelection === 'function') {
+                setCharacterSourceSelection(e.target.value);
+                const cp = typeof getCharacterSourcePickerState === 'function' ? getCharacterSourcePickerState(uiLang) : null;
+                if (cp?.canBindTargetChar && state.bindAfterScope === 'none') {
+                    state.bindAfterScope = 'target_char';
+                }
+                requestRender({ preserveBodyScroll: true });
+            }
+        });
         win.querySelector('#pcx-fg-src-char')?.addEventListener('change', e => { state.wizUseChar = e.target.checked; });
         win.querySelector('#pcx-fg-src-scen')?.addEventListener('change', e => { state.wizUseScenario = e.target.checked; });
         win.querySelector('#pcx-fg-src-pers')?.addEventListener('change', e => { state.wizUsePersona = e.target.checked; });
@@ -3273,6 +3509,29 @@ export function createForgeController(deps) {
 
     return {
         onEnterForge() { state.screen = 'shelf'; fetchBooksList().then(() => { if (state.screen === 'shelf') requestRender({ preserveBodyScroll: true }); }); },
+        onEnterForgeWithCard(card = {}) {
+            state.wizMode = 'ai_adapt';
+            state.wizUseChar = true;
+            state.wizUseScenario = true;
+            state.wizStatus = '';
+            const safeCover = sanitizeCoverDataUrl(card.coverDataUrl || '');
+            if (safeCover) state.targetCover = safeCover;
+            const preferredWorld = String(card.world || '').trim();
+            const suggestedName = preferredWorld || (card.name ? `${card.name} — Лорбук` : '');
+            if (suggestedName) state.targetBookName = suggestedName;
+            const cp = typeof getCharacterSourcePickerState === 'function' ? getCharacterSourcePickerState('ru') : null;
+            state.bindAfterScope = cp?.canBindTargetChar ? 'target_char' : (stApi.isChatOpen() ? 'chat' : 'none');
+            state.screen = 'wizard';
+            fetchBooksList().then(() => {
+                if (preferredWorld && state.books.some(b => b.file_id === preferredWorld)) {
+                    state.targetBookMode = 'existing';
+                    state.targetExistingId = preferredWorld;
+                } else {
+                    state.targetBookMode = 'new';
+                }
+                if (state.screen === 'wizard') requestRender({ preserveBodyScroll: true });
+            });
+        },
         ensureBooksLoadedQuietly() { if (!state.books.length && !state.loading) fetchBooksList().catch(() => {}); },
         getShelfSnapshot() {
             return state.books.map(b => ({

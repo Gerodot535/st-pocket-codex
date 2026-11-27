@@ -1,7 +1,7 @@
-import { THEMES, LANGUAGES, HELP_TIPS, HELP_TIPS_EN, ICONS, THEME_CRESTS, SUITE_CSS, renderProceduralCoverSvg } from './modules/themes_and_icons.js';
-import { CODEX_PROMPT_PRESETS, FORGE_BOOK_PRESETS, formatCleanParagraphs, isSchemaUnsupportedError, unwrapAndParseModelJson, UI_DICT, tUi, displayCategoryName } from './modules/presets_and_i18n.js';
-import { createForgeController, sanitizeCoverDataUrl } from './modules/forge_module.js';
-import { executePcxAiRequest, lastPcxAiDiagnostics, toBlobDisplayUrl, readImageFileLossless } from './modules/ai_engine.js';
+import { THEMES, LANGUAGES, HELP_TIPS, HELP_TIPS_EN, ICONS, THEME_CRESTS, SUITE_CSS, renderProceduralCoverSvg } from './modules/themes_and_icons.js?v=1.1.6';
+import { CODEX_PROMPT_PRESETS, FORGE_BOOK_PRESETS, formatCleanParagraphs, isSchemaUnsupportedError, unwrapAndParseModelJson, UI_DICT, tUi, displayCategoryName } from './modules/presets_and_i18n.js?v=1.1.6';
+import { createForgeController, sanitizeCoverDataUrl } from './modules/forge_module.js?v=1.1.6';
+import { executePcxAiRequest, lastPcxAiDiagnostics, toBlobDisplayUrl, readImageFileLossless } from './modules/ai_engine.js?v=1.1.6';
 
 const MODULE_NAME = 'st_pocket_codex';
 const PROMPT_KEY_PREFIX = 'st_pcx_slot_';
@@ -110,6 +110,8 @@ const uiState = {
     subModal: null,          // null | 'settings' | 'guide' | 'layers' | 'section' | 'diagnostics'
     secModalMode: 'edit',    // 'create' | 'edit'
     secModalCatId: '',
+    externalCard: null,      // Handoff character definitions from NexusMatch Forge
+    selectedCharSource: '',  // '' (active chat) | '__nmf__' (externalCard) | ST character avatar filename
     secDraft: null,
     notebookCoverTarget: '', // 'chat' | 'global'
 };
@@ -396,6 +398,185 @@ async function initStApi() {
             await this.refreshWorldInfoUI();
             return Boolean(nextVal);
         },
+        getCharactersBoundToBook(bookId) {
+            if (!bookId) return [];
+            const c = this.ctx || {};
+            const chars = Array.isArray(c.characters) ? c.characters : [];
+            const charLoreArr = Array.isArray(worldInfoModRef?.world_info?.charLore)
+                ? worldInfoModRef.world_info.charLore
+                : [];
+            const out = [];
+            for (const ch of chars) {
+                if (!ch?.avatar) continue;
+                const primary = String(ch?.data?.extensions?.world || '').trim();
+                const auxRec = charLoreArr.find(r => r && r.name === ch.avatar);
+                const extras = Array.isArray(auxRec?.extraBooks) ? auxRec.extraBooks : [];
+                if (primary === bookId) {
+                    out.push({ avatar: ch.avatar, name: ch.name || ch.avatar, mode: 'primary' });
+                } else if (extras.includes(bookId)) {
+                    out.push({ avatar: ch.avatar, name: ch.name || ch.avatar, mode: 'extra' });
+                }
+            }
+            return out;
+        },
+        async toggleBookForCharacterAvatar(bookId, avatarFileName) {
+            if (!bookId || !avatarFileName) return { ok: false };
+            const c = this.ctx || {};
+            const chars = Array.isArray(c.characters) ? c.characters : [];
+            const idx = chars.findIndex(ch => ch?.avatar === avatarFileName);
+            if (idx === -1) return { ok: false };
+            const ch = chars[idx];
+            const isCurrentSingleChar = !c.groupId && Number(c.characterId) === idx;
+            const curPrimary = String(ch?.data?.extensions?.world || '').trim();
+            const wiObj = worldInfoModRef?.world_info;
+            if (wiObj && !Array.isArray(wiObj.charLore)) wiObj.charLore = [];
+            const charLoreArr = Array.isArray(wiObj?.charLore) ? wiObj.charLore : null;
+            const auxRec = charLoreArr ? charLoreArr.find(r => r && r.name === avatarFileName) : null;
+            const curExtras = Array.isArray(auxRec?.extraBooks) ? [...auxRec.extraBooks] : [];
+
+            const UNSET_EXTENSION_FIELD = '__@@UNSET@@__';
+            const setPrimary = async (val) => {
+                if (isCurrentSingleChar && typeof worldInfoModRef?.charUpdatePrimaryWorld === 'function') {
+                    await worldInfoModRef.charUpdatePrimaryWorld(val);
+                } else if (typeof c.writeExtensionField === 'function') {
+                    await c.writeExtensionField(idx, 'world', val || UNSET_EXTENSION_FIELD);
+                }
+                if (!ch.data) ch.data = {};
+                if (!ch.data.extensions) ch.data.extensions = {};
+                if (val) ch.data.extensions.world = val;
+                else delete ch.data.extensions.world;
+                if (isCurrentSingleChar && window.jQuery) window.jQuery('#character_world').val(val);
+            };
+
+            if (curPrimary === bookId) {
+                await setPrimary('');
+                await this.refreshWorldInfoUI();
+                return { ok: true, bound: false };
+            }
+            if (curExtras.includes(bookId) && charLoreArr) {
+                const nextExtras = curExtras.filter(b => b !== bookId);
+                if (auxRec) {
+                    auxRec.extraBooks = nextExtras;
+                    if (nextExtras.length === 0) {
+                        const rIdx = charLoreArr.indexOf(auxRec);
+                        if (rIdx !== -1) charLoreArr.splice(rIdx, 1);
+                    }
+                }
+                this.saveSettings();
+                await this.refreshWorldInfoUI();
+                return { ok: true, bound: false };
+            }
+            if (!curPrimary) {
+                await setPrimary(bookId);
+                await this.refreshWorldInfoUI();
+                return { ok: true, bound: true, mode: 'primary' };
+            }
+            if (charLoreArr) {
+                if (auxRec) {
+                    if (!auxRec.extraBooks.includes(bookId)) auxRec.extraBooks.push(bookId);
+                } else {
+                    charLoreArr.push({ name: avatarFileName, extraBooks: [bookId] });
+                }
+                this.saveSettings();
+                await this.refreshWorldInfoUI();
+                return { ok: true, bound: true, mode: 'extra' };
+            }
+            await setPrimary(bookId);
+            await this.refreshWorldInfoUI();
+            return { ok: true, bound: true, mode: 'primary' };
+        },
+        async listCharacterChatsWithLore(avatarFileName) {
+            if (!avatarFileName) return [];
+            try {
+                const res = await fetch('/api/characters/chats', {
+                    method: 'POST',
+                    headers: this.getRequestHeaders(),
+                    body: JSON.stringify({ avatar_url: avatarFileName, metadata: true }),
+                });
+                if (!res.ok) return [];
+                const data = await res.json();
+                if (!Array.isArray(data)) return [];
+                return data.map(item => {
+                    const rawFile = String(item?.file_name || item?.file_id || '').trim();
+                    const cleanId = rawFile.replace(/\.jsonl$/i, '');
+                    const meta = item?.chat_metadata || {};
+                    const books = [];
+                    if (meta.world_info) books.push(String(meta.world_info));
+                    if (Array.isArray(meta.pcx_extra_world_info)) {
+                        for (const b of meta.pcx_extra_world_info) {
+                            if (b && !books.includes(String(b))) books.push(String(b));
+                        }
+                    }
+                    return {
+                        fileId: cleanId,
+                        label: cleanId,
+                        lastMes: String(item?.mes || '').replace(/\s+/g, ' ').trim().slice(0, 70),
+                        books,
+                    };
+                }).filter(x => x.fileId);
+            } catch {
+                return [];
+            }
+        },
+        async toggleBookInSavedChat(bookId, avatarFileName, chatFileId) {
+            if (!bookId || !avatarFileName || !chatFileId) return { ok: false };
+            const cleanChatId = String(chatFileId).replace(/\.jsonl$/i, '');
+            const c = this.ctx || {};
+            const chars = Array.isArray(c.characters) ? c.characters : [];
+            const ch = chars.find(x => x?.avatar === avatarFileName);
+            const activeChatId = String(c.getCurrentChatId?.() || c.chatId || '').replace(/\.jsonl$/i, '');
+            const isActiveOpenChat = this.isChatOpen() && !c.groupId && ch && chars[c.characterId]?.avatar === avatarFileName && activeChatId === cleanChatId;
+            if (isActiveOpenChat) {
+                const bound = await this.toggleChatLorebook(bookId);
+                return { ok: true, bound };
+            }
+            const getRes = await fetch('/api/chats/get', {
+                method: 'POST',
+                headers: this.getRequestHeaders(),
+                body: JSON.stringify({ ch_name: ch?.name || '', file_name: cleanChatId, avatar_url: avatarFileName }),
+            });
+            if (!getRes.ok) throw new Error(`HTTP ${getRes.status}`);
+            const chatArr = await getRes.json();
+            if (!Array.isArray(chatArr) || chatArr.length === 0) {
+                throw new Error('Файл чата пуст или недоступен.');
+            }
+            if (!chatArr[0] || typeof chatArr[0] !== 'object' || !chatArr[0].chat_metadata) {
+                chatArr.unshift({ user_name: 'unused', character_name: 'unused', chat_metadata: {} });
+            }
+            const meta = chatArr[0].chat_metadata;
+            const list = [];
+            if (meta.world_info) list.push(String(meta.world_info));
+            if (Array.isArray(meta.pcx_extra_world_info)) {
+                for (const b of meta.pcx_extra_world_info) {
+                    if (b && !list.includes(String(b))) list.push(String(b));
+                }
+            }
+            const pos = list.indexOf(bookId);
+            const willBind = pos === -1;
+            if (willBind) list.push(bookId);
+            else list.splice(pos, 1);
+
+            if (list.length === 0) {
+                delete meta.world_info;
+                delete meta.pcx_extra_world_info;
+            } else {
+                meta.world_info = list[0];
+                if (list.length > 1) meta.pcx_extra_world_info = list.slice(1);
+                else delete meta.pcx_extra_world_info;
+            }
+
+            const saveRes = await fetch('/api/chats/save', {
+                method: 'POST',
+                headers: this.getRequestHeaders(),
+                body: JSON.stringify({ ch_name: ch?.name || '', file_name: cleanChatId, chat: chatArr, avatar_url: avatarFileName }),
+            });
+            if (!saveRes.ok) {
+                const errData = await saveRes.json().catch(() => ({}));
+                throw new Error(errData?.error || `HTTP ${saveRes.status}`);
+            }
+            return { ok: true, bound: willBind };
+        },
+        getActiveChatDisplayName: (uiLang = 'ru') => getActiveChatDisplayName(uiLang),
         wasWiEntryActivated(bookName, uid) {
             if (!bookName || uid === undefined || uid === null) return false;
             return lastActivatedWiKeys.has(`${bookName}::${uid}`);
@@ -689,10 +870,163 @@ function formatSingleCharCard(ch, fallbackName, { includeScenario = true } = {})
     return parts.length ? `[Описание персонажа (${name})]\n${parts.join('\n')}` : '';
 }
 
+function resolveMatchedStCharIndex(cardObj) {
+    const chars = Array.isArray(stApi?.ctx?.characters) ? stApi.ctx.characters : [];
+    if (!cardObj || !chars.length) return -1;
+    const srcAv = String(cardObj.sourceAvatarId || '').trim();
+    if (srcAv) {
+        const byAv = chars.findIndex(c => c && c.avatar === srcAv);
+        if (byAv !== -1) return byAv;
+    }
+    const nm = String(cardObj.name || '').trim().toLowerCase();
+    if (nm) {
+        const byName = chars.findIndex(c => String(c?.name || '').trim().toLowerCase() === nm);
+        if (byName !== -1) return byName;
+    }
+    return -1;
+}
+
+function getCharacterSourcePickerState(uiLang = 'ru') {
+    const chars = Array.isArray(stApi?.ctx?.characters) ? stApi.ctx.characters : [];
+    const ext = uiState.externalCard;
+    const hasExt = Boolean(ext && (ext.name || ext.description || ext.first_mes || ext.scenario));
+    let activeVal = uiState.selectedCharSource || '';
+    if (activeVal === '__nmf__' && !hasExt) activeVal = '';
+    if (activeVal && activeVal !== '__nmf__' && !chars.some(c => c?.avatar === activeVal)) activeVal = '';
+
+    let matchedStChar = null;
+    if (activeVal === '__nmf__' && hasExt) {
+        const idx = resolveMatchedStCharIndex(ext);
+        if (idx !== -1) matchedStChar = chars[idx];
+    } else if (activeVal && activeVal !== '__nmf__') {
+        matchedStChar = chars.find(c => c?.avatar === activeVal) || null;
+    }
+
+    const activeChatLabel = stApi?.isChatOpen?.()
+        ? `${tUi(uiLang, '[Активный чат]', '[Active Chat]')} ${getActiveChatDisplayName(uiLang)}`
+        : tUi(uiLang, '[Активный чат — сейчас не открыт]', '[Active Chat — none open]');
+
+    const options = [];
+    if (hasExt) {
+        const nm = ext.name || tUi(uiLang, 'Новый персонаж', 'New Character');
+        const stTag = matchedStChar ? tUi(uiLang, ' · есть в СТ', ' · in ST') : tUi(uiLang, ' · определения из Редактора', ' · Editor definitions');
+        options.push({
+            value: '__nmf__',
+            label: `[NexusMatch] ${nm}${stTag}`,
+        });
+    }
+    options.push({ value: '', label: activeChatLabel });
+    for (const ch of chars) {
+        if (!ch?.avatar) continue;
+        options.push({
+            value: ch.avatar,
+            label: `${ch.name || ch.avatar}`,
+        });
+    }
+
+    return {
+        selectedValue: activeVal,
+        hasExternalCard: hasExt,
+        externalName: ext?.name || '',
+        canBindTargetChar: Boolean(matchedStChar),
+        targetCharName: matchedStChar?.name || ext?.name || '',
+        options,
+    };
+}
+
+function setCharacterSourceSelection(val) {
+    uiState.selectedCharSource = String(val || '');
+}
+
+async function bindLorebookToTargetChar(fileId) {
+    if (!fileId) return false;
+    const ctx = stApi?.ctx;
+    const chars = Array.isArray(ctx?.characters) ? ctx.characters : [];
+    let targetIdx = -1;
+    if (uiState.selectedCharSource === '__nmf__' && uiState.externalCard) {
+        targetIdx = resolveMatchedStCharIndex(uiState.externalCard);
+    } else if (uiState.selectedCharSource) {
+        targetIdx = chars.findIndex(c => c?.avatar === uiState.selectedCharSource);
+    } else if (!ctx?.groupId && ctx?.characterId !== undefined && ctx?.characterId !== null && chars[ctx.characterId]) {
+        targetIdx = Number(ctx.characterId);
+    }
+    if (targetIdx !== -1 && typeof ctx?.writeExtensionField === 'function') {
+        if (!ctx.groupId && Number(ctx.characterId) === targetIdx && typeof stApi.toggleCharLorebook === 'function') {
+            if (stApi.getCharLorebook?.() !== fileId) await stApi.toggleCharLorebook(fileId);
+        } else {
+            await ctx.writeExtensionField(targetIdx, 'world', fileId);
+            if (chars[targetIdx]?.data?.extensions) chars[targetIdx].data.extensions.world = fileId;
+        }
+        return true;
+    }
+    return false;
+}
+
+function getEffectiveScenarioText() {
+    try {
+        const ctx = stApi.ctx;
+        const chars = Array.isArray(ctx.characters) ? ctx.characters : [];
+        if (uiState.selectedCharSource === '__nmf__' && uiState.externalCard) {
+            const ext = uiState.externalCard;
+            const stIdx = resolveMatchedStCharIndex(ext);
+            const stCh = stIdx !== -1 ? chars[stIdx] : null;
+            const scen = String(ext.scenario || stCh?.scenario || stCh?.data?.scenario || '').trim();
+            const firstMes = String(ext.first_mes || stCh?.first_mes || '').trim();
+            const parts = [scen, firstMes].filter(Boolean);
+            return parts.length ? `[Сценарий и завязка]\n${parts.join('\n\n')}` : '';
+        }
+        if (uiState.selectedCharSource) {
+            const ch = chars.find(c => c?.avatar === uiState.selectedCharSource);
+            if (ch) {
+                const scen = String(ch.scenario || ch.data?.scenario || '').trim();
+                const firstMes = String(ch.first_mes || '').trim();
+                const parts = [scen, firstMes].filter(Boolean);
+                return parts.length ? `[Сценарий и завязка]\n${parts.join('\n\n')}` : '';
+            }
+        }
+        const scenParts = [];
+        if (ctx.groupId && Array.isArray(ctx.groups)) {
+            const grp = ctx.groups.find(g => String(g.id) === String(ctx.groupId));
+            if (grp && Array.isArray(grp.members)) {
+                for (const av of grp.members.slice(0, 5)) {
+                    const mCh = chars.find(c => c.avatar === av);
+                    const mScen = (mCh?.scenario || mCh?.data?.scenario || '').trim();
+                    if (mScen) scenParts.push(`${mCh.name || 'Персонаж'}: ${mScen}`);
+                }
+            }
+        } else {
+            const ch = (ctx.characterId !== undefined && ctx.characterId !== null) ? chars[ctx.characterId] : null;
+            const scen = (ch?.scenario || ch?.data?.scenario || '').trim();
+            const firstMes = (ch?.first_mes || '').trim();
+            if (scen) scenParts.push(scen);
+            if (firstMes) scenParts.push(firstMes);
+        }
+        return scenParts.length ? `[Сценарий и завязка]\n${scenParts.join('\n\n')}` : '';
+    } catch { return ''; }
+}
+
 function getCharacterDescriptionText({ includeScenario = true } = {}) {
     try {
         const ctx = stApi.ctx;
         const chars = Array.isArray(ctx.characters) ? ctx.characters : [];
+        if (uiState.selectedCharSource === '__nmf__' && uiState.externalCard) {
+            const ext = uiState.externalCard;
+            const stIdx = resolveMatchedStCharIndex(ext);
+            const stCh = stIdx !== -1 ? chars[stIdx] : null;
+            const merged = {
+                name: ext.name || stCh?.name || 'Персонаж',
+                description: ext.description || stCh?.description || stCh?.data?.description || '',
+                personality: ext.personality || stCh?.personality || stCh?.data?.personality || '',
+                scenario: ext.scenario || stCh?.scenario || stCh?.data?.scenario || '',
+            };
+            const baseCard = formatSingleCharCard(merged, merged.name, { includeScenario });
+            const exMes = String(ext.mes_example || stCh?.mes_example || '').trim();
+            return exMes ? `${baseCard}\nПримеры речи:\n${exMes}` : baseCard;
+        }
+        if (uiState.selectedCharSource) {
+            const picked = chars.find(c => c?.avatar === uiState.selectedCharSource);
+            if (picked) return formatSingleCharCard(picked, picked.name, { includeScenario });
+        }
         if (ctx.groupId && Array.isArray(ctx.groups)) {
             const grp = ctx.groups.find(g => String(g.id) === String(ctx.groupId));
             if (grp && Array.isArray(grp.members)) {
@@ -751,7 +1085,10 @@ function extractNoteFromModelOutput(raw) {
         }
     }
     let txt = typeof raw === 'string' ? raw : (typeof raw?.content === 'string' ? raw.content : (raw?.choices?.[0]?.message?.content || raw?.text || ''));
-    txt = String(txt || '').replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+    txt = String(txt || '')
+        .replace(/<(?:think|thought|thinking|thoughts|reasoning|cot|thought_process|inner_monologue|inner_thoughts|analysis|rp_plan)\b[^>]*>[\s\S]*?<\/(?:think|thought|thinking|thoughts|reasoning|cot|thought_process|inner_monologue|inner_thoughts|analysis|rp_plan)>/gi, '')
+        .replace(/^[\s\S]*?<\/(?:think|thought|thinking|thoughts|reasoning|cot|thought_process|inner_monologue|inner_thoughts|analysis|rp_plan)>\s*/i, '')
+        .trim();
     const unfenced = txt.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim();
     const tm = unfenced.match(/^(?:ЗАГОЛОВОК|TITLE|НАЗВАНИЕ)\s*:\s*(.+)$/im);
     if (tm) {
@@ -3448,6 +3785,10 @@ jQuery(async () => {
         ensureSettings,
         getConnectionProfiles,
         getCharacterDescriptionText,
+        getEffectiveScenarioText,
+        getCharacterSourcePickerState,
+        setCharacterSourceSelection,
+        bindLorebookToTargetChar,
         getUserPersonaDescriptionText,
         buildChatContextSnippet,
         buildWordLimitPhrase,
@@ -3457,10 +3798,18 @@ jQuery(async () => {
     mountUI();
     stApi.registerMacro('notebook', () => buildMacroNotebookText());
 
-    // External launcher integration (e.g. from NexusMatch Forge)
-    window.addEventListener('pcx:open-forge', () => {
+    // External launcher integration (e.g. from NexusMatch Forge with character definitions)
+    window.addEventListener('pcx:open-forge', (ev) => {
+        if (ev?.cancelable) ev.preventDefault();
+        const incomingCard = ev?.detail?.card;
         uiState.wing = 'forge';
-        forgeCtrl.onEnterForge();
+        if (incomingCard && typeof incomingCard === 'object' && (incomingCard.name || incomingCard.description || incomingCard.first_mes || incomingCard.scenario)) {
+            uiState.externalCard = incomingCard;
+            uiState.selectedCharSource = '__nmf__';
+            forgeCtrl.onEnterForgeWithCard(incomingCard);
+        } else {
+            forgeCtrl.onEnterForge();
+        }
         openModal();
     });
 

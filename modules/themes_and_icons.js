@@ -1073,6 +1073,33 @@ dialog#pcx-sub-dialog button, dialog#pcx-sub-dialog input, dialog#pcx-sub-dialog
     flex-shrink: 0;
     flex-wrap: nowrap;
 }
+.pcx-entry-tongue {
+    appearance: none;
+    margin: 2px auto -10px;
+    padding: 2px 22px 3px;
+    min-height: 20px;
+    background: var(--paper);
+    border: 1px solid var(--line);
+    border-bottom: none;
+    border-radius: 7px 7px 0 0;
+    color: var(--muted);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: color 0.15s ease, background 0.15s ease, border-color 0.15s ease;
+}
+.pcx-entry-tongue:hover,
+.pcx-entry-row.pcx-is-open .pcx-entry-tongue {
+    color: var(--accent);
+    border-color: var(--line-strong);
+    background: var(--accent-wash);
+}
+.pcx-entry-tongue svg {
+    width: 14px;
+    height: 14px;
+    display: block;
+}
 
 .pcx-card-floating {
     position: fixed !important;
